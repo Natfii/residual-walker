@@ -1,0 +1,14 @@
+# provisioned at first run by the launcher
+.venv/
+.tools/
+.model
+
+# user output
+exports/
+
+# build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.exe
