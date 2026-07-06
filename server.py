@@ -197,13 +197,14 @@ class Walker:
     def forward_states(self, input_ids, patch=None):
         """Full forward pass; returns residual stream states [n_points, seq, hidden].
 
-        patch steers the stream at the last position right after that layer's
-        block. Two modes:
-          {"mode": "nudge", "layer", "alpha", "unit"} — the spider→ant push:
-              h += alpha * ||h|| * unit_direction.
+        patch steers the stream right after that layer's block. Two modes:
+          {"mode": "nudge", "layer", "alpha", "unit"} — the spider→ant push at
+              the last position only: h += alpha * ||h|| * unit_direction.
           {"mode": "swap", "layer", "alpha", "basis"} — paper-style J-space
               swap: permute the state's coordinates in the two-J-lens-vector
-              frame (basis [hidden, 2]); alpha=1 is the exact swap.
+              frame (basis [hidden, 2]) at EVERY position; alpha=1 is exact.
+              All positions, because the concept usually lives in the context
+              tokens — attention re-imports it downstream if they're left alone.
         """
         self.recorder.reset()
         handle = None
@@ -212,16 +213,18 @@ class Walker:
 
             def steer_hook(module, inputs, output):
                 h = output[0] if isinstance(output, tuple) else output
+                h = h.clone()
                 if patch["mode"] == "swap":
-                    x = h[0, -1, :].float()
+                    x = h[0].float()                              # [seq, hidden]
                     V = patch["basis"]
                     gram = V.T @ V + 1e-6 * torch.eye(2, device=V.device)
-                    coords = torch.linalg.solve(gram, V.T @ x)
-                    vec = (alpha * (V @ (coords.flip(0) - coords))).to(h.dtype)
+                    coords = torch.linalg.solve(gram, V.T @ x.T)  # [2, seq]
+                    delta = (alpha * (V @ (coords.flip(0) - coords)).T).to(h.dtype)
+                    h[0] += delta
+                    vec = delta[-1]
                 else:
                     vec = alpha * h[0, -1, :].norm() * patch["unit"]
-                h = h.clone()
-                h[0, -1, :] += vec
+                    h[0, -1, :] += vec
                 recorder.patch_vec = vec.detach()
                 recorder.patch_layer = patch["layer"]
                 if isinstance(output, tuple):

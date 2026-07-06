@@ -76,9 +76,15 @@ When a pre-fitted lens exists for the loaded model (fitted by
 [Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens) with
 Anthropic's [jlens](https://github.com/anthropics/jacobian-lens)), the
 walker downloads it automatically and a **logit / J-lens toggle** appears
-above the lens panel. Try `Fact: the number of legs on the animal that spins
-webs is` on Qwen3-1.7B and flip to the J-lens: *spider* surfaces mid-path —
-the stepping-stone the model thinks with but never says.
+above the lens panel. Verified demo on Qwen3-1.7B: walk `The capital of the
+country where the Eiffel Tower stands is` and flip to the J-lens mid-path —
+it reads *capital* → *this city* → *city* while the logit lens still shows
+noise: the model knows **what kind of thing** it will say before it knows
+the word. Two honest notes from testing at this scale: on bilingual models
+the J-lens often voices dispositions in Chinese tokens (首都 = capital —
+that's the concept space being multilingual, not a bug), and the paper's
+spider-legs demo needs a bigger model — 1.7B never resolves the two-hop
+riddle at all, so there's no silent *spider* to see. Try Qwen3-4B or 8B.
 
 Lens-ready models: **Qwen3 1.7B / 4B / 8B / 14B / 32B**, Qwen2.5-7B-Instruct,
 and Llama-3.1-8B(-Instruct). Point `RESIDUAL_WALKER_JLENS=<lens.pt>` at a
@@ -118,13 +124,22 @@ The PCA projection is always fit on the unpatched prompt, so a nudged walk
 and a clean walk of the same prompt render in the same coordinates — run
 both and compare the paths directly.
 
-When a J-lens is loaded, a second patch mode appears: **J-swap**, the paper's
-own intervention. Instead of pushing the state along a direction, it reads
-the state's coordinates in the frame of the two concepts' *J-lens vectors*
-(`v_w = J_lᵀ·u_w` — the unembedding row pulled back through the fitted
-transport), exchanges the two coordinates, and writes the result back,
-leaving everything orthogonal untouched. Concept A *becomes* concept B
-mid-flight; strength 1.0 is the exact swap.
+When a J-lens is loaded, a second patch mode appears: **J-swap**, modeled on
+the paper's intervention. Instead of pushing the state along a direction, it
+reads the state's coordinates in the frame of the two concepts' *J-lens
+vectors* (`v_w = J_lᵀ·u_w` — the unembedding row pulled back through the
+fitted transport), exchanges the two coordinates at **every position**, and
+writes the result back, leaving everything orthogonal untouched. Strength
+1.0 is the exact swap.
+
+An honest finding from testing on Qwen3-1.7B: the exact swap usually
+**loses** — even France↔Italy at every position and 3× overdrive cannot
+move "The capital of France is" off Paris, while the crude nudge flips it
+easily. A concept's mid-layer representation is far richer than its single
+"will-eventually-say-this-word" readout direction, and the network routes
+around a rank-2 edit. Watching the surgical swap fail where the sledgehammer
+succeeds is itself the lesson about distributed representations (and about
+why the paper's swaps were done on much larger models).
 
 ## MP4 export
 
