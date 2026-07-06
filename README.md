@@ -124,6 +124,18 @@ The PCA projection is always fit on the unpatched prompt, so a nudged walk
 and a clean walk of the same prompt render in the same coordinates — run
 both and compare the paths directly.
 
+**Sticky steering** — tick *sticky* to re-apply the patch at every layer
+from *at layer* through *to layer* (defaults to the ¾ mark: re-injecting in
+the final "motor zone" layers just parrots the token instead of steering the
+thought). One-shot early nudges get healed by the network's self-repair;
+sticky ones outrun it — this is how Golden-Gate-style continuous steering
+works. It compounds hard across the range, so the steering window is tiny
+and finding it is the game: on Qwen3-1.7B, `+China −France` sticky over
+layers 2→20 flips "The capital of France is" to **Beijing** at strength
+0.05–0.08, degrades to parroting "China" by 0.12, and collapses into
+whitespace by 0.2. A violet diamond rail marks the patched range on the
+path.
+
 When a J-lens is loaded, a second patch mode appears: **J-swap**, modeled on
 the paper's intervention. Instead of pushing the state along a direction, it
 reads the state's coordinates in the frame of the two concepts' *J-lens

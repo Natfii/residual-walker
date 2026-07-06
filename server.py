@@ -90,8 +90,7 @@ class ResidualRecorder:
         self.embed_out = None
         self.attn_deltas = []
         self.mlp_deltas = []
-        self.patch_vec = None       # steering vector actually applied this forward
-        self.patch_layer = None
+        self.patch_vecs = {}        # {layer: steering vector applied this forward}
         model.model.embed_tokens.register_forward_hook(self._grab_embed)
         for layer in model.model.layers:
             layer.self_attn.register_forward_hook(self._grab_attn)
@@ -111,8 +110,7 @@ class ResidualRecorder:
         self.embed_out = None
         self.attn_deltas.clear()
         self.mlp_deltas.clear()
-        self.patch_vec = None
-        self.patch_layer = None
+        self.patch_vecs.clear()
 
     def stream_states(self):
         """Rebuild the residual stream at every sub-layer boundary.
@@ -128,9 +126,9 @@ class ResidualRecorder:
             s = s + attn[0]
             points.append(s)
             s = s + mlp[0]
-            if self.patch_vec is not None and i == self.patch_layer:
+            if i in self.patch_vecs:
                 pad = torch.zeros_like(s)
-                pad[-1] = self.patch_vec
+                pad[-1] = self.patch_vecs[i]
                 s = s + pad
             points.append(s)
         return torch.stack(points)
@@ -197,45 +195,54 @@ class Walker:
     def forward_states(self, input_ids, patch=None):
         """Full forward pass; returns residual stream states [n_points, seq, hidden].
 
-        patch steers the stream right after that layer's block. Two modes:
-          {"mode": "nudge", "layer", "alpha", "unit"} — the spider→ant push at
+        patch steers the stream right after each block in patch["layers"] —
+        a single layer normally, a layer→end range in sticky mode (re-applying
+        every block is how steering outruns the network's self-repair). Modes:
+          {"mode": "nudge", "layers", "alpha", "unit"} — the spider→ant push at
               the last position only: h += alpha * ||h|| * unit_direction.
-          {"mode": "swap", "layer", "alpha", "basis"} — paper-style J-space
+          {"mode": "swap", "layers", "alpha", "bases"} — paper-style J-space
               swap: permute the state's coordinates in the two-J-lens-vector
-              frame (basis [hidden, 2]) at EVERY position; alpha=1 is exact.
-              All positions, because the concept usually lives in the context
-              tokens — attention re-imports it downstream if they're left alone.
+              frame (bases[layer] is [hidden, 2]) at EVERY position; alpha=1 is
+              exact. All positions, because the concept usually lives in the
+              context tokens — attention re-imports it if they're left alone.
         """
         self.recorder.reset()
-        handle = None
+        handles = []
         if patch is not None:
             recorder, alpha = self.recorder, patch["alpha"]
 
-            def steer_hook(module, inputs, output):
-                h = output[0] if isinstance(output, tuple) else output
-                h = h.clone()
-                if patch["mode"] == "swap":
-                    x = h[0].float()                              # [seq, hidden]
-                    V = patch["basis"]
-                    gram = V.T @ V + 1e-6 * torch.eye(2, device=V.device)
-                    coords = torch.linalg.solve(gram, V.T @ x.T)  # [2, seq]
-                    delta = (alpha * (V @ (coords.flip(0) - coords)).T).to(h.dtype)
-                    h[0] += delta
-                    vec = delta[-1]
-                else:
-                    vec = alpha * h[0, -1, :].norm() * patch["unit"]
-                    h[0, -1, :] += vec
-                recorder.patch_vec = vec.detach()
-                recorder.patch_layer = patch["layer"]
-                if isinstance(output, tuple):
-                    return (h,) + tuple(output[1:])
-                return h
+            def make_hook(layer_idx):
+                def steer_hook(module, inputs, output):
+                    h = output[0] if isinstance(output, tuple) else output
+                    if patch["mode"] == "swap":
+                        V = patch["bases"].get(layer_idx)
+                        if V is None:
+                            return output
+                        h = h.clone()
+                        x = h[0].float()                              # [seq, hidden]
+                        gram = V.T @ V + 1e-6 * torch.eye(2, device=V.device)
+                        coords = torch.linalg.solve(gram, V.T @ x.T)  # [2, seq]
+                        delta = (alpha * (V @ (coords.flip(0) - coords)).T).to(h.dtype)
+                        h[0] += delta
+                        vec = delta[-1]
+                    else:
+                        h = h.clone()
+                        vec = alpha * h[0, -1, :].norm() * patch["unit"]
+                        h[0, -1, :] += vec
+                    recorder.patch_vecs[layer_idx] = vec.detach()
+                    if isinstance(output, tuple):
+                        return (h,) + tuple(output[1:])
+                    return h
+                return steer_hook
 
-            handle = self.model.model.layers[patch["layer"]].register_forward_hook(steer_hook)
+            handles = [
+                self.model.model.layers[i].register_forward_hook(make_hook(i))
+                for i in patch["layers"]
+            ]
         try:
             self.model(input_ids, use_cache=False)
         finally:
-            if handle is not None:
+            for handle in handles:
                 handle.remove()
         return self.recorder.stream_states()
 
@@ -503,22 +510,38 @@ async def walk(ws: WebSocket):
                 layer = max(0, min(walker.n_layers - 1, int(patch_req.get("layer", walker.n_layers // 2))))
                 alpha = max(0.0, min(6.0, float(patch_req.get("alpha", 1.5))))
                 mode = str(patch_req.get("mode", "nudge"))
+                sticky = bool(patch_req.get("sticky"))
+                if sticky:
+                    # default range stops before the final quarter — re-injecting
+                    # in the motor zone just parrots the token instead of steering
+                    default_end = walker.n_layers - 1 - walker.n_layers // 4
+                    layer_end = int(patch_req.get("layer_end", default_end))
+                    layer_end = max(layer, min(walker.n_layers - 1, layer_end))
+                    layers = list(range(layer, layer_end + 1))
+                else:
+                    layer_end = layer
+                    layers = [layer]
                 if mode == "swap":
-                    basis, add_tok, remove_tok = walker.swap_basis(
-                        patch_req.get("add"), patch_req.get("remove"), layer
-                    )
-                    if basis is not None and alpha > 0:
-                        patch = {"mode": "swap", "layer": layer, "alpha": alpha, "basis": basis}
+                    bases, add_tok, remove_tok = {}, None, None
+                    for l in layers:
+                        basis, add_tok, remove_tok = walker.swap_basis(
+                            patch_req.get("add"), patch_req.get("remove"), l
+                        )
+                        if basis is not None:
+                            bases[l] = basis
+                    if bases and alpha > 0:
+                        patch = {"mode": "swap", "layers": layers, "alpha": alpha, "bases": bases}
                 else:
                     unit, add_tok, remove_tok = walker.steer_direction(
                         patch_req.get("add"), patch_req.get("remove")
                     )
                     if unit is not None and alpha > 0:
-                        patch = {"mode": "nudge", "layer": layer, "alpha": alpha, "unit": unit}
+                        patch = {"mode": "nudge", "layers": layers, "alpha": alpha, "unit": unit}
                 if patch is not None:
                     patch_echo = {
                         "active": True, "mode": mode, "add": add_tok, "remove": remove_tok,
-                        "layer": layer, "alpha": alpha, "step": 2 * layer + 2,
+                        "layer": layer, "layer_end": layer_end, "alpha": alpha,
+                        "sticky": sticky, "step": 2 * layer + 2,
                     }
 
             ids = walker.tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)

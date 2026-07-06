@@ -300,8 +300,14 @@
     <label class="field"><span>at layer</span>
       <input id="patchLayer" type="number" min="0" max="99" value="4">
     </label>
+    <label class="field" id="patchEndField" style="display:none"><span>to layer (sticky)</span>
+      <input id="patchLayerEnd" type="number" min="0" max="99" value="20">
+    </label>
     <label class="field"><span>strength <span class="rangeVal" id="patchAlphaVal">2.5</span></span>
-      <input id="patchAlpha" type="range" min="0" max="5" step="0.1" value="2.5">
+      <input id="patchAlpha" type="range" min="0" max="5" step="0.05" value="2.5">
+    </label>
+    <label class="check" style="grid-column: 1 / -1">
+      <input id="patchSticky" type="checkbox"> sticky — re-apply at every layer to the end
     </label>
     <label class="check" style="grid-column: 1 / -1">
       <input id="patchOn" type="checkbox"> inject during walks (activation patching)
@@ -423,7 +429,7 @@ const guessEl = $('guess'), statusEl = $('status'), storyEl = $('story');
 const lensEl = $('lens'), stepReadout = $('stepReadout');
 $('temp').oninput = e => $('tempVal').textContent = Number(e.target.value).toFixed(2);
 $('speed').oninput = e => $('speedVal').textContent = `${e.target.value} ms`;
-$('patchAlpha').oninput = e => $('patchAlphaVal').textContent = Number(e.target.value).toFixed(1);
+$('patchAlpha').oninput = e => $('patchAlphaVal').textContent = Number(e.target.value).toFixed(2);
 $('orbit').onchange = e => controls.autoRotate = e.target.checked;
 controls.autoRotate = $('orbit').checked;
 
@@ -441,11 +447,19 @@ function setLensMode(m) {
 }
 $('lensModeLogit').onclick = () => setLensMode('logit');
 $('lensModeJ').onclick = () => setLensMode('jlens');
-$('patchMode').onchange = e => {
-  // an exact paper swap is alpha = 1; the nudge default pushes harder
-  const alpha = e.target.value === 'swap' ? '1.0' : '2.5';
+function defaultPatchAlpha() {
+  // sticky compounds across every layer in its range, so it wants a feather
+  // (the steering window sits near 0.05-0.1); an exact paper swap is alpha = 1;
+  // the one-shot nudge pushes harder
+  const alpha = $('patchSticky').checked ? '0.1'
+    : $('patchMode').value === 'swap' ? '1.0' : '2.5';
   $('patchAlpha').value = alpha;
-  $('patchAlphaVal').textContent = Number(alpha).toFixed(1);
+  $('patchAlphaVal').textContent = Number(alpha).toFixed(2);
+}
+$('patchMode').onchange = defaultPatchAlpha;
+$('patchSticky').onchange = () => {
+  $('patchEndField').style.display = $('patchSticky').checked ? 'block' : 'none';
+  defaultPatchAlpha();
 };
 
 /* configure the UI from the server before any walk */
@@ -457,6 +471,8 @@ fetch('/api/info').then(r => r.json()).then(info => {
     $('lensSwitch').style.display = 'flex';
     $('patchSwapOpt').disabled = false;
   }
+  // sticky default range ends before the motor zone (final quarter of layers)
+  $('patchLayerEnd').value = Math.max(0, info.n_layers - 1 - Math.floor(info.n_layers / 4));
 }).catch(() => {});
 
 /** Make control characters in a token visible without breaking layout. */
@@ -617,7 +633,8 @@ class TokenPath {
       this.spheres.push(start);
     } else {
       this.line.geometry.instanceCount = k;   // k revealed segments
-      const isNudge = patchInfo?.active && k === patchInfo.step;
+      const isNudge = patchInfo?.active && (k === patchInfo.step ||
+        (patchInfo.sticky && k > patchInfo.step && k <= 2 * patchInfo.layer_end + 2 && kind === 'mlp'));
       const dot = isNudge
         ? new THREE.Mesh(patchGeo, patchMat)
         : new THREE.Mesh(sphereGeo, sphereMats[kind]);
@@ -625,7 +642,7 @@ class TokenPath {
       dot.position.copy(this.positions[k]);
       this.group.add(dot);
       this.spheres.push(dot);
-      if (isNudge) fireRing(this.positions[k], 0x9085e9, 6);
+      if (isNudge && k === patchInfo.step) fireRing(this.positions[k], 0x9085e9, 6);
     }
     this.revealed++;
     return true;
@@ -821,7 +838,8 @@ function drawRecordingOverlay(ctx, w, h) {
     if (patchInfo.add) parts.push(`+${patchInfo.add.trim()}`);
     if (patchInfo.remove) parts.push(`−${patchInfo.remove.trim()}`);
     const verb = patchInfo.mode === 'swap' ? '🔁 J-swap' : '💉 nudge';
-    ctx.fillText(`${verb} ${parts.join(' ')} @ layer ${patchInfo.layer} ×${patchInfo.alpha}`, textX, ty + 14 * s);
+    const range = patchInfo.sticky ? `${patchInfo.layer}→${patchInfo.layer_end}` : `${patchInfo.layer}`;
+    ctx.fillText(`${verb} ${parts.join(' ')} @ layer ${range} ×${patchInfo.alpha}`, textX, ty + 14 * s);
     ty += 18 * s;
   }
   if (tourInfo) {
@@ -909,7 +927,9 @@ function startWalk() {
         add: $('patchAdd').value.trim() || null,
         remove: $('patchRemove').value.trim() || null,
         mode: $('patchMode').value,
+        sticky: $('patchSticky').checked,
         layer: Number($('patchLayer').value),
+        layer_end: Number($('patchLayerEnd').value),
         alpha: Number($('patchAlpha').value),
       } : null,
     }));
@@ -971,6 +991,9 @@ function updateLens(k) {
   let where = info.kind === 'embed' ? 'embedding — the path begins' : `${info.kind === 'attn' ? 'attention' : 'MLP'} add · layer ${info.layer}`;
   if (patchInfo?.active && k === patchInfo.step) {
     where += patchInfo.mode === 'swap' ? ' · 🔁 swapped!' : ' · 💉 nudged!';
+  } else if (patchInfo?.active && patchInfo.sticky && k > patchInfo.step
+             && k <= 2 * patchInfo.layer_end + 2 && info.kind === 'mlp') {
+    where += ' · 💉';
   }
 
   let rows = current.lens[k];
