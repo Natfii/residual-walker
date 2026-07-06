@@ -105,6 +105,10 @@ tour turns away from the best angle and recover as it swings back.
 
 ## Nudge the stream (activation patching)
 
+<img src="docs/orange-quiz-loop.webp" width="720" alt="A J-swapped walk: dozens of ghost paths stream comet-like from the embedding cluster while the model spirals into a question loop">
+
+<sup>Qwen3-1.7B · prompt “The capital of France is” · J-swap +Orange −Europe · sticky, layers 4→24 · strength 0.1 · temp 0.7 · 48 tokens · 2× speed</sup>
+
 The spider→ant experiment from Anthropic's global-workspace research, at
 home: pick an **add concept** and/or **remove concept**, a layer, and a
 strength, tick **inject during walks**, and every generated token gets a
