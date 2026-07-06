@@ -1,0 +1,228 @@
+/* Residual Walker — panel, stage overlays, lens, and control styling.
+   Palette: dark-mode slots from the validated categorical set. */
+
+  :root {
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --border: rgba(255, 255, 255, 0.10);
+    --attn: #3987e5;
+    --mlp: #d95926;
+    --embed: #ffffff;
+    --ghost: #898781;
+    --bar: #199e70;
+    --patch: #9085e9;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    overflow: hidden;
+  }
+
+  /* ---------- 3D stage ---------- */
+  #stage { flex: 1; position: relative; min-width: 0; }
+  #stage canvas { display: block; }
+
+  #legend {
+    position: absolute; left: 16px; bottom: 14px;
+    display: flex; gap: 18px; flex-wrap: wrap;
+    font-size: 12px; color: var(--ink-2);
+    pointer-events: none;
+  }
+  #legend .item { display: flex; align-items: center; gap: 6px; }
+  #legend .dot { width: 9px; height: 9px; border-radius: 50%; }
+
+  #guess {
+    position: absolute; pointer-events: none;
+    transform: translate(14px, -50%);
+    background: rgba(26, 26, 25, 0.88);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 9px;
+    font-size: 13px;
+    white-space: pre;
+    display: none;
+  }
+  #guess .prob { color: var(--muted); font-variant-numeric: tabular-nums; margin-left: 6px; }
+  #guess.fired { border-color: var(--bar); font-weight: 700; font-size: 15px; }
+
+  #hint {
+    position: absolute; right: 16px; bottom: 14px;
+    font-size: 11px; color: var(--muted); pointer-events: none;
+  }
+
+  #shadowMeter {
+    position: absolute; top: 14px; left: 16px;
+    background: rgba(26, 26, 25, 0.88);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 13px;
+    min-width: 208px;
+    display: none;
+    pointer-events: none;
+  }
+  #shadowMeter .cap {
+    font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 3px;
+  }
+  #shadowMeter .big {
+    font-size: 21px; font-weight: 700; color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+  #shadowMeter .big small { font-size: 11px; font-weight: 400; color: var(--muted); }
+  #shadowMeter .bar {
+    height: 6px; background: var(--page); border-radius: 3px;
+    overflow: hidden; margin-top: 6px;
+  }
+  #shadowMeter .fill { height: 100%; width: 0%; background: var(--bar); border-radius: 3px; }
+  #shadowMeter .mode { margin-top: 5px; font-size: 11px; color: var(--muted); }
+
+  /* ---------- side panel ---------- */
+  #panel {
+    width: 344px; flex: none;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    padding: 18px 18px 28px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  h1 { font-size: 17px; font-weight: 700; }
+  #modelChip { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  label.field { display: block; font-size: 12px; color: var(--ink-2); }
+  label.field > span { display: block; margin-bottom: 4px; }
+
+  textarea, input[type="number"], input[type="text"] {
+    width: 100%;
+    background: var(--page);
+    color: var(--ink);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 9px;
+    font: inherit;
+    font-size: 13px;
+    resize: vertical;
+  }
+  textarea:focus, input:focus { outline: 1px solid var(--attn); }
+
+  .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; }
+  input[type="range"] { width: 100%; accent-color: var(--attn); }
+  .rangeVal { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink-2); }
+  .check input { accent-color: var(--attn); }
+
+  .buttons { display: flex; gap: 10px; }
+  button {
+    font: inherit; font-size: 13px; font-weight: 600;
+    border-radius: 6px; padding: 8px 16px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  #walkBtn { background: var(--attn); color: #fff; flex: 1; }
+  #walkBtn:hover:not(:disabled) { filter: brightness(1.12); }
+  #stopBtn, .buttons .ctl { background: transparent; color: var(--ink-2); border-color: var(--border); }
+  #stopBtn:hover:not(:disabled), .buttons .ctl:hover:not(:disabled) { border-color: var(--ink-2); }
+  .buttons .ctl { padding: 8px 11px; font-variant-numeric: tabular-nums; }
+  button:disabled { opacity: 0.45; cursor: default; }
+
+  #status { font-size: 12px; color: var(--muted); min-height: 15px; }
+  #export { font-size: 12px; min-height: 0; }
+  #export a { color: var(--attn); font-weight: 600; text-decoration: none; }
+  #export a:hover { text-decoration: underline; }
+
+  .sectionTitle {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--muted);
+  }
+
+  #story {
+    background: var(--page);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 11px;
+    font-size: 13.5px;
+    line-height: 1.55;
+    min-height: 58px;
+    max-height: 140px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #story .prompt { color: var(--ink-2); }
+  #story .gen { color: var(--ink); font-weight: 600; }
+  #story .gen.flash { animation: flash 0.9s ease-out; border-radius: 3px; }
+  @keyframes flash {
+    0% { background: var(--bar); color: #fff; }
+    100% { background: transparent; }
+  }
+
+  /* ---------- logit lens ---------- */
+  #stepReadout {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+    min-height: 18px;
+  }
+  #stepReadout .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+
+  #lens { display: flex; flex-direction: column; gap: 7px; }
+  .lensRow { display: grid; grid-template-columns: 92px 1fr 44px; gap: 8px; align-items: center; }
+  .lensRow .tok {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px; color: var(--ink-2);
+    white-space: pre; overflow: hidden; text-overflow: ellipsis;
+    background: var(--page);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 6px;
+  }
+  .lensRow.top .tok { color: var(--ink); font-weight: 700; }
+  .lensRow .track { height: 12px; background: var(--page); border-radius: 4px; overflow: hidden; }
+  .lensRow .fill {
+    height: 100%; width: 0%;
+    background: var(--bar);
+    border-radius: 4px 3px 3px 4px;
+    transition: width 130ms ease;
+  }
+  .lensRow .pct {
+    font-size: 11.5px; color: var(--muted);
+    font-variant-numeric: tabular-nums; text-align: right;
+  }
+  .lensRow.top .pct { color: var(--ink-2); }
+  .lensSwitch { display: flex; margin: 2px 0 6px; }
+  .lensSwitch button {
+    flex: 1; font-size: 11px; padding: 4px 8px; cursor: pointer;
+    background: var(--page); color: var(--muted); border: 1px solid var(--border);
+  }
+  .lensSwitch button:first-child { border-radius: 6px 0 0 6px; }
+  .lensSwitch button:last-child { border-radius: 0 6px 6px 0; border-left: none; }
+  .lensSwitch button.on { background: #199e70; color: #fff; border-color: #199e70; }
+  .field select {
+    background: var(--page); color: var(--ink); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font-size: 12px;
+  }
+
+  #promptDetails summary {
+    font-size: 11px; color: var(--muted); cursor: pointer;
+    user-select: none; list-style-position: inside;
+  }
+  #promptDetails summary:hover { color: var(--ink-2); }
+  #promptTokens {
+    font-size: 11px; color: var(--muted); line-height: 1.9;
+    max-height: 96px; overflow-y: auto; overflow-wrap: anywhere;
+    margin-top: 4px;
+  }
+  #promptTokens code {
+    font-family: ui-monospace, Consolas, monospace;
+    background: var(--page); border: 1px solid var(--border);
+    border-radius: 4px; padding: 1px 5px; margin-right: 4px;
+    white-space: pre-wrap;
+  }
+  .foot { font-size: 11px; color: var(--muted); line-height: 1.5; }

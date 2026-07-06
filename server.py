@@ -393,11 +393,23 @@ EXPORTS_DIR.mkdir(exist_ok=True)
 app.mount("/exports", StaticFiles(directory=EXPORTS_DIR), name="exports")
 
 
+# no-cache on all frontend files: they version together with the WS protocol,
+# so a stale cached copy must never talk to a newer server
 @app.get("/")
 async def index():
-    # no-cache: the frontend and the WS protocol version together, so a stale
-    # cached page must never talk to a newer server
     return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/styles.css")
+async def styles():
+    return FileResponse(STATIC_DIR / "styles.css", media_type="text/css",
+                        headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/walker.js")
+async def walker_js():
+    return FileResponse(STATIC_DIR / "walker.js", media_type="text/javascript",
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/info")
