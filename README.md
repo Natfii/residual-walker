@@ -3,6 +3,9 @@
 Watch a real transformer draw its residual-stream path through 3D space, one
 Euler step at a time, until it fires a token.
 
+<img width="2166" height="1278" alt="re-ezgif com-video-to-webp-converter" src="https://github.com/user-attachments/assets/978e5e32-1f8b-4343-9849-27e6700a8a0b" />
+
+
 Every layer in a transformer updates the hidden state by **addition**:
 `h = h + attention(norm(h))`, then `h = h + mlp(norm(h))` — each `+` is one
 forward-Euler step. Residual Walker runs a small LLM locally, captures the
