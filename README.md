@@ -128,6 +128,19 @@ The PCA projection is always fit on the unpatched prompt, so a nudged walk
 and a clean walk of the same prompt render in the same coordinates — run
 both and compare the paths directly.
 
+**Whole phrases work too** — a multi-token concept switches the nudge to
+activation-based directions (ActAdd/CAA style): the phrase is run through
+the model and its mean residual state at each layer becomes that layer's
+steering direction (the export overlay marks these runs "phrase vibes").
+One important craft note: a lone phrase mostly carries generic "phrase-ness"
+and acts like an unlabeled kick. The real technique is a **contrast pair** —
+matched phrases in *add* and *remove* so everything shared cancels and only
+the difference steers. Verified on Qwen3-4B: add *"La capitale de la France
+est une belle ville magnifique"*, remove the same sentence in English,
+sticky 1→10 — at strength 0.1 Franglais leaks in ("The capitale de France
+is"), at 0.2 the model answers in French ("la ville de la France"), by 0.35
+it breaks. The language direction, isolated by subtraction.
+
 **Sticky steering** — tick *sticky* to re-apply the patch at every layer
 from *at layer* through *to layer* (defaults to the ¾ mark: re-injecting in
 the final "motor zone" layers just parrots the token instead of steering the

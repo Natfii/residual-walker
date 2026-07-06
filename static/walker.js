@@ -487,8 +487,10 @@ function drawRecordingOverlay(ctx, w, h) {
     ctx.fillStyle = '#9085e9';
     ctx.font = `${11 * s}px system-ui, sans-serif`;
     const parts = [];
-    if (patchInfo.add) parts.push(`+${patchInfo.add.trim()}`);
-    if (patchInfo.remove) parts.push(`−${patchInfo.remove.trim()}`);
+    const shortLabel = t => t.length > 26 ? t.slice(0, 25) + '…' : t;
+    if (patchInfo.add) parts.push(`+${shortLabel(patchInfo.add.trim())}`);
+    if (patchInfo.remove) parts.push(`−${shortLabel(patchInfo.remove.trim())}`);
+    if (patchInfo.source === 'phrase') parts.push('(phrase vibes)');
     const verb = patchInfo.mode === 'swap' ? '🔁 J-swap' : '💉 nudge';
     const range = patchInfo.sticky ? `${patchInfo.layer}→${patchInfo.layer_end}` : `${patchInfo.layer}`;
     ctx.fillText(`${verb} ${parts.join(' ')} @ layer ${range} ×${patchInfo.alpha}`, textX, ty + 14 * s);

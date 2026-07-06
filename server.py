@@ -198,8 +198,10 @@ class Walker:
         patch steers the stream right after each block in patch["layers"] —
         a single layer normally, a layer→end range in sticky mode (re-applying
         every block is how steering outruns the network's self-repair). Modes:
-          {"mode": "nudge", "layers", "alpha", "unit"} — the spider→ant push at
-              the last position only: h += alpha * ||h|| * unit_direction.
+          {"mode": "nudge", "layers", "alpha", "units"} — the spider→ant push at
+              the last position only: h += alpha * ||h|| * units[layer]
+              (units are per-layer: unembedding-row for single tokens, the
+              phrase's own mean residual states for multi-token concepts).
           {"mode": "swap", "layers", "alpha", "bases"} — paper-style J-space
               swap: permute the state's coordinates in the two-J-lens-vector
               frame (bases[layer] is [hidden, 2]) at EVERY position; alpha=1 is
@@ -226,8 +228,11 @@ class Walker:
                         h[0] += delta
                         vec = delta[-1]
                     else:
+                        unit = patch["units"].get(layer_idx)
+                        if unit is None:
+                            return output
                         h = h.clone()
-                        vec = alpha * h[0, -1, :].norm() * patch["unit"]
+                        vec = alpha * h[0, -1, :].norm() * unit
                         h[0, -1, :] += vec
                     recorder.patch_vecs[layer_idx] = vec.detach()
                     if isinstance(output, tuple):
@@ -246,33 +251,71 @@ class Walker:
                 handle.remove()
         return self.recorder.stream_states()
 
-    def steer_direction(self, add_text, remove_text):
-        """Unit steering direction built from unembedding rows: unit(add) - unit(remove).
+    @torch.inference_mode()
+    def phrase_layer_means(self, text):
+        """Forward a phrase and return its mean residual state per block output.
 
-        Returns (direction, add_token_str, remove_token_str); direction is None
-        if neither concept resolves to a token.
+        The mean is over real tokens (BOS excluded) — this is the model's own
+        representation of the phrase at each depth, the ActAdd/CAA-style
+        source for steering directions when a concept is more than one token.
         """
-        def unit_row(text):
-            ids = self.tokenizer.encode(" " + text.strip(), add_special_tokens=False)
-            if not ids:
-                return None, None
-            row = self.model.lm_head.weight[ids[0]].float()
-            return row / row.norm(), self.tokenizer.decode([ids[0]])
+        ids = self.tokenizer(" " + text.strip(), return_tensors="pt").input_ids.to(DEVICE)
+        states = self.forward_states(ids)
+        bos = self.tokenizer.bos_token_id
+        start = 1 if (bos is not None and ids.shape[1] > 1 and ids[0, 0].item() == bos) else 0
+        return {i: states[2 * i + 2, start:, :].float().mean(dim=0) for i in range(self.n_layers)}
 
-        direction = torch.zeros(self.hidden, device=DEVICE)
-        add_tok = remove_tok = None
-        if add_text:
-            vec, add_tok = unit_row(add_text)
-            if vec is not None:
-                direction = direction + vec
-        if remove_text:
-            vec, remove_tok = unit_row(remove_text)
-            if vec is not None:
-                direction = direction - vec
-        norm = direction.norm()
-        if norm < 1e-6:
-            return None, add_tok, remove_tok
-        return (direction / norm).to(DTYPE), add_tok, remove_tok
+    def steer_directions(self, add_text, remove_text):
+        """Per-layer unit steering directions {layer: vec} plus echo info.
+
+        Single-token concepts: one unembedding-row direction, shared by every
+        layer (the calibrated classic). Any multi-token concept switches both
+        sides to phrase mode: activation-based directions from the model's own
+        mean residual states, layer-matched.
+
+        Returns (units, add_label, remove_label, source) — units is None when
+        nothing resolves; source is "token" or "phrase".
+        """
+        def ids_of(text):
+            return self.tokenizer.encode(" " + text.strip(), add_special_tokens=False) if text else []
+
+        add_ids, remove_ids = ids_of(add_text), ids_of(remove_text)
+        if not add_ids and not remove_ids:
+            return None, None, None, None
+
+        if len(add_ids) <= 1 and len(remove_ids) <= 1:
+            direction = torch.zeros(self.hidden, device=DEVICE)
+            add_tok = remove_tok = None
+            if add_ids:
+                row = self.model.lm_head.weight[add_ids[0]].float()
+                direction = direction + row / row.norm()
+                add_tok = self.tokenizer.decode([add_ids[0]])
+            if remove_ids:
+                row = self.model.lm_head.weight[remove_ids[0]].float()
+                direction = direction - row / row.norm()
+                remove_tok = self.tokenizer.decode([remove_ids[0]])
+            norm = direction.norm()
+            if norm < 1e-6:
+                return None, add_tok, remove_tok, "token"
+            unit = (direction / norm).to(DTYPE)
+            return {i: unit for i in range(self.n_layers)}, add_tok, remove_tok, "token"
+
+        add_means = self.phrase_layer_means(add_text) if add_ids else None
+        remove_means = self.phrase_layer_means(remove_text) if remove_ids else None
+        units = {}
+        for i in range(self.n_layers):
+            d = torch.zeros(self.hidden, device=DEVICE)
+            if add_means is not None:
+                d = d + add_means[i] / add_means[i].norm()
+            if remove_means is not None:
+                d = d - remove_means[i] / remove_means[i].norm()
+            norm = d.norm()
+            if norm > 1e-6:
+                units[i] = (d / norm).to(DTYPE)
+        if not units:
+            return None, add_text, remove_text, "phrase"
+        return units, add_text.strip() if add_text else None, \
+            remove_text.strip() if remove_text else None, "phrase"
 
     @torch.inference_mode()
     def lens_logits(self, path_states):
@@ -544,16 +587,17 @@ async def walk(ws: WebSocket):
                     if bases and alpha > 0:
                         patch = {"mode": "swap", "layers": layers, "alpha": alpha, "bases": bases}
                 else:
-                    unit, add_tok, remove_tok = walker.steer_direction(
+                    units, add_tok, remove_tok, source = walker.steer_directions(
                         patch_req.get("add"), patch_req.get("remove")
                     )
-                    if unit is not None and alpha > 0:
-                        patch = {"mode": "nudge", "layers": layers, "alpha": alpha, "unit": unit}
+                    if units is not None and alpha > 0:
+                        patch = {"mode": "nudge", "layers": layers, "alpha": alpha, "units": units}
                 if patch is not None:
                     patch_echo = {
                         "active": True, "mode": mode, "add": add_tok, "remove": remove_tok,
                         "layer": layer, "layer_end": layer_end, "alpha": alpha,
                         "sticky": sticky, "step": 2 * layer + 2,
+                        "source": source if mode != "swap" else "token",
                     }
 
             ids = walker.tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
