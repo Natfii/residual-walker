@@ -50,6 +50,8 @@ class ResidualRecorder:
         self.embed_out = None
         self.attn_deltas = []
         self.mlp_deltas = []
+        self.patch_vec = None       # steering vector actually applied this forward
+        self.patch_layer = None
         model.model.embed_tokens.register_forward_hook(self._grab_embed)
         for layer in model.model.layers:
             layer.self_attn.register_forward_hook(self._grab_attn)
@@ -69,19 +71,27 @@ class ResidualRecorder:
         self.embed_out = None
         self.attn_deltas.clear()
         self.mlp_deltas.clear()
+        self.patch_vec = None
+        self.patch_layer = None
 
     def stream_states(self):
         """Rebuild the residual stream at every sub-layer boundary.
 
         Returns a tensor of shape [n_points, seq, hidden] where
         n_points = 1 + 2 * n_layers (embedding, then attn add, mlp add, ...).
+        If a steering patch was applied this forward, it is folded in at its
+        layer boundary so the reconstructed path matches what the model saw.
         """
         s = self.embed_out[0]  # [seq, hidden]
         points = [s]
-        for attn, mlp in zip(self.attn_deltas, self.mlp_deltas):
+        for i, (attn, mlp) in enumerate(zip(self.attn_deltas, self.mlp_deltas)):
             s = s + attn[0]
             points.append(s)
             s = s + mlp[0]
+            if self.patch_vec is not None and i == self.patch_layer:
+                pad = torch.zeros_like(s)
+                pad[-1] = self.patch_vec
+                s = s + pad
             points.append(s)
         return torch.stack(points)
 
@@ -107,11 +117,64 @@ class Walker:
         print(f"[residual-walker] ready: {self.n_layers} layers, hidden={self.hidden}")
 
     @torch.inference_mode()
-    def forward_states(self, input_ids):
-        """Full forward pass; returns residual stream states [n_points, seq, hidden]."""
+    def forward_states(self, input_ids, patch=None):
+        """Full forward pass; returns residual stream states [n_points, seq, hidden].
+
+        patch = {"layer": int, "alpha": float, "unit": tensor[hidden]} steers the
+        stream at the last position right after that layer's block — the
+        spider→ant experiment: h += alpha * ||h|| * unit_direction.
+        """
         self.recorder.reset()
-        self.model(input_ids, use_cache=False)
+        handle = None
+        if patch is not None:
+            recorder, alpha, unit = self.recorder, patch["alpha"], patch["unit"]
+
+            def steer_hook(module, inputs, output):
+                h = output[0] if isinstance(output, tuple) else output
+                vec = alpha * h[0, -1, :].norm() * unit
+                h = h.clone()
+                h[0, -1, :] += vec
+                recorder.patch_vec = vec.detach()
+                recorder.patch_layer = patch["layer"]
+                if isinstance(output, tuple):
+                    return (h,) + tuple(output[1:])
+                return h
+
+            handle = self.model.model.layers[patch["layer"]].register_forward_hook(steer_hook)
+        try:
+            self.model(input_ids, use_cache=False)
+        finally:
+            if handle is not None:
+                handle.remove()
         return self.recorder.stream_states()
+
+    def steer_direction(self, add_text, remove_text):
+        """Unit steering direction built from unembedding rows: unit(add) - unit(remove).
+
+        Returns (direction, add_token_str, remove_token_str); direction is None
+        if neither concept resolves to a token.
+        """
+        def unit_row(text):
+            ids = self.tokenizer.encode(" " + text.strip(), add_special_tokens=False)
+            if not ids:
+                return None, None
+            row = self.model.lm_head.weight[ids[0]].float()
+            return row / row.norm(), self.tokenizer.decode([ids[0]])
+
+        direction = torch.zeros(self.hidden, device=DEVICE)
+        add_tok = remove_tok = None
+        if add_text:
+            vec, add_tok = unit_row(add_text)
+            if vec is not None:
+                direction = direction + vec
+        if remove_text:
+            vec, remove_tok = unit_row(remove_text)
+            if vec is not None:
+                direction = direction - vec
+        norm = direction.norm()
+        if norm < 1e-6:
+            return None, add_tok, remove_tok
+        return (direction / norm).to(DTYPE), add_tok, remove_tok
 
     @torch.inference_mode()
     def lens_logits(self, path_states):
@@ -255,9 +318,29 @@ async def walk(ws: WebSocket):
             temperature = float(req.get("temperature", 0.7))
             max_new = min(int(req.get("max_new_tokens", 10)), MAX_NEW_TOKENS_CAP)
 
+            patch = None
+            patch_echo = {"active": False}
+            patch_req = req.get("patch") or {}
+            if patch_req.get("add") or patch_req.get("remove"):
+                layer = max(0, min(walker.n_layers - 1, int(patch_req.get("layer", walker.n_layers // 2))))
+                alpha = max(0.0, min(6.0, float(patch_req.get("alpha", 1.5))))
+                unit, add_tok, remove_tok = walker.steer_direction(
+                    patch_req.get("add"), patch_req.get("remove")
+                )
+                if unit is not None and alpha > 0:
+                    patch = {"layer": layer, "alpha": alpha, "unit": unit}
+                    patch_echo = {
+                        "active": True, "add": add_tok, "remove": remove_tok,
+                        "layer": layer, "alpha": alpha, "step": 2 * layer + 2,
+                    }
+
             ids = walker.tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
+            # PCA basis is always fit on the unpatched forward, so nudged and
+            # clean walks of the same prompt share a projection and compare 1:1.
             states = await asyncio.to_thread(walker.forward_states, ids)
             pca, scale = await asyncio.to_thread(walker.fit_projection, states)
+            if patch is not None:
+                states = await asyncio.to_thread(walker.forward_states, ids, patch)
 
             await ws.send_json({
                 "type": "meta",
@@ -270,6 +353,7 @@ async def walk(ws: WebSocket):
                     "dims": int(pca.n_components_),
                     "var_ratios": [round(float(r), 5) for r in pca.explained_variance_ratio_],
                 },
+                "patch": patch_echo,
                 "prompt_tokens": [
                     token_text(walker.tokenizer, int(t)) for t in ids[0][1:]
                 ],
@@ -279,7 +363,7 @@ async def walk(ws: WebSocket):
             eos = walker.tokenizer.eos_token_id
             for i in range(max_new):
                 if i > 0:
-                    states = await asyncio.to_thread(walker.forward_states, ids)
+                    states = await asyncio.to_thread(walker.forward_states, ids, patch)
                 packet, next_id = await asyncio.to_thread(
                     build_packet, walker, states[:, -1, :], pca, scale, temperature, i
                 )

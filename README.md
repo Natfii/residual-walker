@@ -71,6 +71,27 @@ The **shadow honesty** meter (top-left) shows what fraction of the paths'
 true spread is visible through the current angle — watch it drop as the
 tour turns away from the best angle and recover as it swings back.
 
+## Nudge the stream (activation patching)
+
+The spider→ant experiment from Anthropic's global-workspace research, at
+home: pick an **add concept** and/or **remove concept**, a layer, and a
+strength, tick **inject during walks**, and every generated token gets a
+steering vector `strength · ‖h‖ · unit(add − remove)` added to its residual
+stream right after that layer (built from the concepts' unembedding rows).
+A violet diamond marks the nudge point on the path — watch the trajectory
+kink there and the logit lens flip downstream.
+
+The classic demo: prompt `The capital of France is`, temperature 0, add
+`China`, remove `France`, layer 4, strength 2.5 → the model answers
+**Beijing**. It doesn't parrot the injected word — downstream layers
+*compute with* the swapped concept. Nudge too late (last few layers) or too
+hard and it degrades into parroting (" China China China"): depth and dose
+both matter, and you can see why.
+
+The PCA projection is always fit on the unpatched prompt, so a nudged walk
+and a clean walk of the same prompt render in the same coordinates — run
+both and compare the paths directly.
+
 ## MP4 export
 
 Tick **⏺ record walk → MP4** before hitting Walk. The scene is recorded

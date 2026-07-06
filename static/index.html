@@ -19,6 +19,7 @@
     --embed: #ffffff;
     --ghost: #898781;
     --bar: #199e70;
+    --patch: #9085e9;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; }
@@ -103,7 +104,7 @@
   label.field { display: block; font-size: 12px; color: var(--ink-2); }
   label.field > span { display: block; margin-bottom: 4px; }
 
-  textarea, input[type="number"] {
+  textarea, input[type="number"], input[type="text"] {
     width: 100%;
     background: var(--page);
     color: var(--ink);
@@ -215,6 +216,7 @@
     <span class="item"><span class="dot" style="background:var(--attn)"></span>+ attention step</span>
     <span class="item"><span class="dot" style="background:var(--mlp)"></span>+ MLP step</span>
     <span class="item"><span class="dot" style="background:var(--ghost); opacity:.5"></span>earlier tokens (ghosts)</span>
+    <span class="item"><span class="dot" style="background:var(--patch)"></span>💉 nudge point</span>
   </div>
   <div id="guess"></div>
   <div id="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
@@ -254,6 +256,25 @@
     </label>
     <label class="check" style="grid-column: 1 / -1">
       <input id="tour" type="checkbox"> 🖐 grand tour — slowly turn the hand
+    </label>
+  </div>
+
+  <div class="sectionTitle">Nudge the stream 💉</div>
+  <div class="controls">
+    <label class="field"><span>add concept</span>
+      <input id="patchAdd" type="text" placeholder="e.g. China">
+    </label>
+    <label class="field"><span>remove concept</span>
+      <input id="patchRemove" type="text" placeholder="e.g. France">
+    </label>
+    <label class="field"><span>at layer</span>
+      <input id="patchLayer" type="number" min="0" max="99" value="4">
+    </label>
+    <label class="field"><span>strength <span class="rangeVal" id="patchAlphaVal">2.5</span></span>
+      <input id="patchAlpha" type="range" min="0" max="5" step="0.1" value="2.5">
+    </label>
+    <label class="check" style="grid-column: 1 / -1">
+      <input id="patchOn" type="checkbox"> inject during walks (activation patching)
     </label>
   </div>
 
@@ -335,6 +356,10 @@ const sphereMats = {
   embed: new THREE.MeshStandardMaterial({ color: COLORS.embed, emissive: 0x888888, emissiveIntensity: 0.35, roughness: 0.3 }),
   ghost: new THREE.MeshStandardMaterial({ color: COLORS.ghost, transparent: true, opacity: 0.4, roughness: 0.6 }),
 };
+const patchGeo = new THREE.OctahedronGeometry(1.15);
+const patchMat = new THREE.MeshStandardMaterial({
+  color: 0x9085e9, emissive: 0x9085e9, emissiveIntensity: 0.5, roughness: 0.3,
+});
 const headMarker = new THREE.Mesh(
   new THREE.SphereGeometry(1.05, 24, 18),
   new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.65, roughness: 0.2 })
@@ -358,6 +383,7 @@ const guessEl = $('guess'), statusEl = $('status'), storyEl = $('story');
 const lensEl = $('lens'), stepReadout = $('stepReadout');
 $('temp').oninput = e => $('tempVal').textContent = Number(e.target.value).toFixed(2);
 $('speed').oninput = e => $('speedVal').textContent = `${e.target.value} ms`;
+$('patchAlpha').oninput = e => $('patchAlphaVal').textContent = Number(e.target.value).toFixed(1);
 $('orbit').onchange = e => controls.autoRotate = e.target.checked;
 controls.autoRotate = $('orbit').checked;
 
@@ -499,11 +525,15 @@ class TokenPath {
       seg.userData.b = k;
       this.group.add(seg);
       this.segments.push(seg);
-      const dot = new THREE.Mesh(sphereGeo, sphereMats[kind]);
+      const isNudge = patchInfo?.active && k === patchInfo.step;
+      const dot = isNudge
+        ? new THREE.Mesh(patchGeo, patchMat)
+        : new THREE.Mesh(sphereGeo, sphereMats[kind]);
       dot.userData.idx = k;
       dot.position.copy(this.positions[k]);
       this.group.add(dot);
       this.spheres.push(dot);
+      if (isNudge) fireRing(this.positions[k], 0x9085e9, 6);
     }
     this.revealed++;
     return true;
@@ -536,14 +566,14 @@ class TokenPath {
 
 /* ---------- fire effect ---------- */
 const rings = [];
-function fireRing(position) {
+function fireRing(position, color = 0xffffff, growth = 14) {
   const ring = new THREE.Mesh(
     new THREE.RingGeometry(0.9, 1.18, 48),
-    new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, side: THREE.DoubleSide })
+    new THREE.MeshBasicMaterial({ color, transparent: true, side: THREE.DoubleSide })
   );
   ring.position.copy(position);
   scene.add(ring);
-  rings.push({ mesh: ring, t: 0 });
+  rings.push({ mesh: ring, t: 0, growth });
 }
 
 /* ---------- walk state machine ---------- */
@@ -559,6 +589,7 @@ let firePauseUntil = 0;
 let promptText = '';               // mirrored for the recording overlay
 let genText = '';
 let lensState = null;              // {k, info, rows} at the current step
+let patchInfo = null;              // activation-patch echo from meta
 
 function setStatus(t) { statusEl.textContent = t; }
 
@@ -609,7 +640,8 @@ function drawRecordingOverlay(ctx, w, h) {
   const rowH = 24 * s;
   const lensRows = lensState ? lensState.rows.length : 0;
   const honestyH = tourInfo ? 18 * s : 0;
-  const cardH = pad * 2 + 20 * s + (lensState ? 26 * s + lensRows * rowH : 0) + honestyH;
+  const patchH = patchInfo?.active ? 18 * s : 0;
+  const cardH = pad * 2 + 20 * s + (lensState ? 26 * s + lensRows * rowH : 0) + honestyH + patchH;
   const x = margin, y = h - margin - cardH;
   const KIND_COLORS = { embed: '#ffffff', attn: '#3987e5', mlp: '#d95926' };
 
@@ -679,6 +711,15 @@ function drawRecordingOverlay(ctx, w, h) {
     ty += 10 * s + lensRows * rowH;
   }
 
+  if (patchInfo?.active) {
+    ctx.fillStyle = '#9085e9';
+    ctx.font = `${11 * s}px system-ui, sans-serif`;
+    const parts = [];
+    if (patchInfo.add) parts.push(`+${patchInfo.add.trim()}`);
+    if (patchInfo.remove) parts.push(`−${patchInfo.remove.trim()}`);
+    ctx.fillText(`💉 nudge ${parts.join(' ')} @ layer ${patchInfo.layer} ×${patchInfo.alpha}`, textX, ty + 14 * s);
+    ty += 18 * s;
+  }
   if (tourInfo) {
     ctx.fillStyle = '#898781';
     ctx.font = `${11 * s}px system-ui, sans-serif`;
@@ -734,6 +775,7 @@ function resetWalk() {
   promptText = '';
   genText = '';
   lensState = null;
+  patchInfo = null;
 }
 
 function startWalk() {
@@ -752,6 +794,12 @@ function startWalk() {
       prompt,
       temperature: Number($('temp').value),
       max_new_tokens: Number($('maxTokens').value),
+      patch: $('patchOn').checked ? {
+        add: $('patchAdd').value.trim() || null,
+        remove: $('patchRemove').value.trim() || null,
+        layer: Number($('patchLayer').value),
+        alpha: Number($('patchAlpha').value),
+      } : null,
     }));
     setStatus('running prompt through the model…');
   };
@@ -760,6 +808,7 @@ function startWalk() {
     if (msg.type === 'meta') {
       steps = msg.steps;
       tourInfo = msg.tour;
+      patchInfo = msg.patch?.active ? msg.patch : null;
       document.getElementById('dimsLabel').textContent = msg.hidden;
       document.getElementById('shadowMeter').style.display = 'block';
       $('modelChip').textContent = `${msg.model} · ${msg.n_layers} layers · ${msg.hidden}-dim stream · ${msg.device}`;
@@ -805,7 +854,8 @@ $('stopBtn').onclick = () => { stopWalk(); setStatus('stopped'); };
 function updateLens(k) {
   const info = steps[k];
   const dotColor = info.kind === 'embed' ? 'var(--embed)' : info.kind === 'attn' ? 'var(--attn)' : 'var(--mlp)';
-  const where = info.kind === 'embed' ? 'embedding — the path begins' : `${info.kind === 'attn' ? 'attention' : 'MLP'} add · layer ${info.layer}`;
+  let where = info.kind === 'embed' ? 'embedding — the path begins' : `${info.kind === 'attn' ? 'attention' : 'MLP'} add · layer ${info.layer}`;
+  if (patchInfo?.active && k === patchInfo.step) where += ' · 💉 nudged!';
   stepReadout.innerHTML = '';
   const dot = document.createElement('span');
   dot.className = 'dot'; dot.style.background = dotColor;
@@ -976,7 +1026,7 @@ function animate(now) {
   for (let i = rings.length - 1; i >= 0; i--) {
     const r = rings[i];
     r.t += 0.024;
-    r.mesh.scale.setScalar(1 + r.t * 14);
+    r.mesh.scale.setScalar(1 + r.t * r.growth);
     r.mesh.material.opacity = Math.max(0, 1 - r.t * 1.4);
     r.mesh.quaternion.copy(camera.quaternion);
     if (r.mesh.material.opacity <= 0) { scene.remove(r.mesh); rings.splice(i, 1); }
