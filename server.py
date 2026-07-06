@@ -448,11 +448,11 @@ def token_text(tokenizer, token_id):
 
 
 def _top_rows(tokenizer, logits):
-    """[vocab] logits → top-K [{t, p}] rows for the lens panel."""
+    """[vocab] logits → top-K [{t, p, i}] rows for the lens panel."""
     probs = torch.softmax(logits, dim=-1)
     top = probs.topk(LENS_TOP_K, dim=-1)
     return [
-        {"t": token_text(tokenizer, int(i)), "p": round(float(p), 4)}
+        {"t": token_text(tokenizer, int(i)), "p": round(float(p), 4), "i": int(i)}
         for i, p in zip(top.indices, top.values)
     ]
 
@@ -465,7 +465,7 @@ def build_packet(walker, path_states, pca, scale, temperature, token_index):
     top = probs.topk(LENS_TOP_K, dim=-1)
     lens = [
         [
-            {"t": token_text(walker.tokenizer, int(i)), "p": round(float(p), 4)}
+            {"t": token_text(walker.tokenizer, int(i)), "p": round(float(p), 4), "i": int(i)}
             for i, p in zip(row_ids, row_ps)
         ]
         for row_ids, row_ps in zip(top.indices, top.values)

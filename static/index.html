@@ -132,8 +132,9 @@
   }
   #walkBtn { background: var(--attn); color: #fff; flex: 1; }
   #walkBtn:hover:not(:disabled) { filter: brightness(1.12); }
-  #stopBtn { background: transparent; color: var(--ink-2); border-color: var(--border); }
-  #stopBtn:hover:not(:disabled) { border-color: var(--ink-2); }
+  #stopBtn, .buttons .ctl { background: transparent; color: var(--ink-2); border-color: var(--border); }
+  #stopBtn:hover:not(:disabled), .buttons .ctl:hover:not(:disabled) { border-color: var(--ink-2); }
+  .buttons .ctl { padding: 8px 11px; font-variant-numeric: tabular-nums; }
   button:disabled { opacity: 0.45; cursor: default; }
 
   #status { font-size: 12px; color: var(--muted); min-height: 15px; }
@@ -316,6 +317,9 @@
 
   <div class="buttons">
     <button id="walkBtn">Walk</button>
+    <button id="pauseBtn" class="ctl" disabled title="pause / resume (Space)">⏸</button>
+    <button id="stepBackBtn" class="ctl" disabled title="step back (←)">‹</button>
+    <button id="stepFwdBtn" class="ctl" disabled title="step forward (→)">›</button>
     <button id="stopBtn" disabled>Stop</button>
   </div>
   <div id="status">ready</div>
@@ -699,6 +703,8 @@ let doneInfo = null;               // set when server sends "done"
 let walking = false;
 let lastStepAt = 0;
 let firePauseUntil = 0;
+let paused = false;
+let viewStep = -1;                 // lens/scrub cursor within the current path
 let promptText = '';               // mirrored for the recording overlay
 let genText = '';
 let lensState = null;              // {k, info, rows} at the current step
@@ -964,8 +970,11 @@ function startWalk() {
   };
   ws.onclose = () => { ws = null; };
   walking = true;
+  setPaused(false);
+  viewStep = -1;
   $('walkBtn').disabled = true;
   $('stopBtn').disabled = false;
+  $('pauseBtn').disabled = false;
 }
 
 function stopWalk(flush = true) {
@@ -977,12 +986,73 @@ function stopWalk(flush = true) {
   queue = [];
   walking = false;
   finishRecording();
+  setPaused(false);
   $('walkBtn').disabled = false;
   $('stopBtn').disabled = true;
+  $('pauseBtn').disabled = true;
+  $('stepBackBtn').disabled = true;
+  $('stepFwdBtn').disabled = true;
 }
 
 $('walkBtn').onclick = startWalk;
 $('stopBtn').onclick = () => { stopWalk(); setStatus('stopped'); };
+
+/* ---------- pause & step-by-step scrubbing ----------
+ * Pausing freezes only the animation: the server keeps generating and the
+ * queue keeps caching finished paths, and every step's lens data already
+ * rides in its packet — so scrubbing is instant, nothing is recomputed. */
+function setPaused(p) {
+  paused = p;
+  $('pauseBtn').textContent = p ? '▶' : '⏸';
+  $('stepBackBtn').disabled = !p;
+  $('stepFwdBtn').disabled = !p;
+  if (!p) lastStepAt = performance.now();   // resume without a catch-up burst
+}
+
+/** One TokenPath begins: ghost the others, reset the scrub cursor. */
+function startNextPath() {
+  if (!queue.length) return false;
+  for (const p of paths) p.ghost();
+  current = new TokenPath(queue.shift(), steps);
+  setStatus(`walking token ${paths.length + 1}…`);
+  lastStepAt = 0;
+  viewStep = -1;
+  return true;
+}
+
+function stepForward() {
+  if (!current) {
+    if (startNextPath() && current.revealNext()) { viewStep = 0; updateLens(0); }
+    return;
+  }
+  if (viewStep < current.revealed - 1) {          // walk the cursor back up first
+    viewStep++;
+    updateLens(viewStep);
+  } else if (!current.done) {                     // then reveal fresh steps
+    current.revealNext();
+    viewStep = current.revealed - 1;
+    updateLens(viewStep);
+  } else {                                        // then fire and begin the next
+    finishCurrent(true);
+    if (startNextPath() && current.revealNext()) { viewStep = 0; updateLens(0); }
+  }
+}
+
+function stepBack() {
+  if (!current || viewStep <= 0) return;
+  viewStep--;
+  updateLens(viewStep);
+}
+
+$('pauseBtn').onclick = () => setPaused(!paused);
+$('stepFwdBtn').onclick = stepForward;
+$('stepBackBtn').onclick = stepBack;
+window.addEventListener('keydown', e => {
+  if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+  if (e.code === 'Space' && !$('pauseBtn').disabled) { e.preventDefault(); setPaused(!paused); }
+  else if (paused && e.key === 'ArrowRight') { e.preventDefault(); stepForward(); }
+  else if (paused && e.key === 'ArrowLeft') { e.preventDefault(); stepBack(); }
+});
 
 /* ---------- per-step UI ---------- */
 function updateLens(k) {
@@ -1019,6 +1089,9 @@ function updateLens(k) {
     row.className = 'lensRow' + (i === 0 ? ' top' : '');
     const tok = document.createElement('span');
     tok.className = 'tok'; tok.textContent = displayToken(r.t);
+    const codepoints = [...r.t].map(ch =>
+      'U+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')).join(' ');
+    tok.title = `token ${r.i ?? '?'} · ${codepoints} · ${(r.p * 100).toFixed(2)}%`;
     const track = document.createElement('div'); track.className = 'track';
     const fill = document.createElement('div'); fill.className = 'fill';
     track.appendChild(fill);
@@ -1129,18 +1202,14 @@ function animate(now) {
   updateTour(now);
 
   if (walking || current || queue.length) {
-    if (!current && queue.length && now >= firePauseUntil) {
-      for (const p of paths) p.ghost();          // fade every earlier token's trail
-      current = new TokenPath(queue.shift(), steps);
-      setStatus(`walking token ${paths.length + 1}…`);
-      lastStepAt = 0;
-    }
-    if (current) {
+    if (!paused && !current && queue.length && now >= firePauseUntil) startNextPath();
+    if (!paused && current) {
       const stepMs = Number($('speed').value);
       if (now - lastStepAt >= stepMs) {
         lastStepAt = now;
         if (current.revealNext()) {
-          updateLens(current.revealed - 1);
+          viewStep = current.revealed - 1;
+          updateLens(viewStep);
         }
         if (current.done) finishCurrent(true);
       }
@@ -1151,6 +1220,9 @@ function animate(now) {
       setTimeout(finishRecording, 900);   // let the last fire-ring land on film
       $('walkBtn').disabled = false;
       $('stopBtn').disabled = true;
+      $('pauseBtn').disabled = true;
+      $('stepBackBtn').disabled = true;
+      $('stepFwdBtn').disabled = true;
       if (ws) { ws.close(); ws = null; }
     }
   }
@@ -1159,7 +1231,8 @@ function animate(now) {
   const active = current;
   if (active && active.revealed > 0) {
     headMarker.visible = true;
-    headMarker.position.copy(active.head);
+    const cursor = Math.max(0, Math.min(viewStep, active.revealed - 1));
+    headMarker.position.copy(active.positions[cursor]);
     const pulse = 1 + 0.16 * Math.sin(t * 6);
     headMarker.scale.setScalar(pulse);
   }
