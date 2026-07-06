@@ -859,7 +859,7 @@ function animate(now) {
     }
     if (!current && !queue.length && doneInfo && walking) {
       walking = false;
-      setStatus(`done — “${doneInfo.text.trim()}”`);
+      setStatus(`done — ${paths.length} tokens (full text in the story box)`);
       setTimeout(finishRecording, 900);   // let the last fire-ring land on film
       $('walkBtn').disabled = false;
       $('stopBtn').disabled = true;

@@ -94,6 +94,9 @@
     overflow-x: hidden;
     display: flex; flex-direction: column; gap: 14px;
   }
+  /* never squish panel rows to fit — scroll instead (squished rows paint
+     their overflowing text over their neighbors) */
+  #panel > * { flex-shrink: 0; }
   h1 { font-size: 17px; font-weight: 700; }
   #modelChip { font-size: 11px; color: var(--muted); margin-top: 2px; }
 

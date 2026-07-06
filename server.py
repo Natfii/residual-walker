@@ -44,7 +44,7 @@ DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 SCENE_RADIUS = 42.0  # world units the prompt's projected states are scaled into
 TOUR_DIMS = 12       # PCA components sent to the browser for the grand tour
 LENS_TOP_K = 5
-MAX_NEW_TOKENS_CAP = 48
+MAX_NEW_TOKENS_CAP = 200
 SAMPLE_TOP_K = 50
 
 # Pre-fitted Jacobian lenses (Neuronpedia, fitted with Anthropic's jlens on
