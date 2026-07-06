@@ -78,8 +78,11 @@
     <label class="field" id="patchEndField" style="display:none"><span>to layer (sticky)</span>
       <input id="patchLayerEnd" type="number" min="0" max="99" value="20">
     </label>
-    <label class="field"><span>strength <span class="rangeVal" id="patchAlphaVal">2.5</span></span>
-      <input id="patchAlpha" type="range" min="0" max="5" step="0.05" value="2.5">
+    <label class="field"><span>strength</span>
+      <div class="alphaRow">
+        <input id="patchAlpha" type="range" min="0" max="5" step="0.05" value="2.5">
+        <input id="patchAlphaNum" type="number" min="0" max="6" step="0.01" value="2.5">
+      </div>
     </label>
     <label class="check" style="grid-column: 1 / -1">
       <input id="patchSticky" type="checkbox"> sticky — re-apply at every layer to the end

@@ -76,7 +76,10 @@ const guessEl = $('guess'), statusEl = $('status'), storyEl = $('story');
 const lensEl = $('lens'), stepReadout = $('stepReadout');
 $('temp').oninput = e => $('tempVal').textContent = Number(e.target.value).toFixed(2);
 $('speed').oninput = e => $('speedVal').textContent = `${e.target.value} ms`;
-$('patchAlpha').oninput = e => $('patchAlphaVal').textContent = Number(e.target.value).toFixed(2);
+/* strength: slider for coarse sweeps, number box for fine-tuning — the
+   number box is the source of truth (type 0.055 if the window demands it) */
+$('patchAlpha').oninput = e => { $('patchAlphaNum').value = e.target.value; };
+$('patchAlphaNum').oninput = e => { $('patchAlpha').value = e.target.value; };
 $('orbit').onchange = e => controls.autoRotate = e.target.checked;
 controls.autoRotate = $('orbit').checked;
 
@@ -101,7 +104,7 @@ function defaultPatchAlpha() {
   const alpha = $('patchSticky').checked ? '0.1'
     : $('patchMode').value === 'swap' ? '1.0' : '2.5';
   $('patchAlpha').value = alpha;
-  $('patchAlphaVal').textContent = Number(alpha).toFixed(2);
+  $('patchAlphaNum').value = alpha;
 }
 $('patchMode').onchange = defaultPatchAlpha;
 $('patchSticky').onchange = () => {
@@ -579,7 +582,7 @@ function startWalk() {
         sticky: $('patchSticky').checked,
         layer: Number($('patchLayer').value),
         layer_end: Number($('patchLayerEnd').value),
-        alpha: Number($('patchAlpha').value),
+        alpha: Number($('patchAlphaNum').value) || 0,
       } : null,
     }));
     setStatus('running prompt through the model…');
