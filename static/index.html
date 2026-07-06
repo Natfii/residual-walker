@@ -197,6 +197,18 @@
     font-variant-numeric: tabular-nums; text-align: right;
   }
   .lensRow.top .pct { color: var(--ink-2); }
+  .lensSwitch { display: flex; margin: 2px 0 6px; }
+  .lensSwitch button {
+    flex: 1; font-size: 11px; padding: 4px 8px; cursor: pointer;
+    background: var(--page); color: var(--muted); border: 1px solid var(--border);
+  }
+  .lensSwitch button:first-child { border-radius: 6px 0 0 6px; }
+  .lensSwitch button:last-child { border-radius: 0 6px 6px 0; border-left: none; }
+  .lensSwitch button.on { background: #199e70; color: #fff; border-color: #199e70; }
+  .field select {
+    background: var(--page); color: var(--ink); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font-size: 12px;
+  }
 
   #promptTokens { font-size: 11px; color: var(--muted); line-height: 1.9; }
   #promptTokens code {
@@ -216,7 +228,7 @@
     <span class="item"><span class="dot" style="background:var(--attn)"></span>+ attention step</span>
     <span class="item"><span class="dot" style="background:var(--mlp)"></span>+ MLP step</span>
     <span class="item"><span class="dot" style="background:var(--ghost); opacity:.5"></span>earlier tokens (ghosts)</span>
-    <span class="item"><span class="dot" style="background:var(--patch)"></span>💉 nudge point</span>
+    <span class="item"><span class="dot" style="background:var(--patch)"></span>💉 patch point (nudge/swap)</span>
   </div>
   <div id="guess"></div>
   <div id="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
@@ -259,13 +271,19 @@
     </label>
   </div>
 
-  <div class="sectionTitle">Nudge the stream 💉</div>
+  <div class="sectionTitle">Patch the stream 💉</div>
   <div class="controls">
     <label class="field"><span>add concept</span>
       <input id="patchAdd" type="text" placeholder="e.g. China">
     </label>
     <label class="field"><span>remove concept</span>
       <input id="patchRemove" type="text" placeholder="e.g. France">
+    </label>
+    <label class="field" style="grid-column: 1 / -1"><span>mode</span>
+      <select id="patchMode">
+        <option value="nudge">nudge — push along add − remove</option>
+        <option value="swap" id="patchSwapOpt" disabled>J-swap — trade the two concepts (paper-style)</option>
+      </select>
     </label>
     <label class="field"><span>at layer</span>
       <input id="patchLayer" type="number" min="0" max="99" value="4">
@@ -289,13 +307,21 @@
   <div id="story"><span class="prompt"></span></div>
   <div id="promptTokens"></div>
 
-  <div class="sectionTitle">Logit lens — “if we fired right now”</div>
+  <div class="sectionTitle" id="lensTitle">Logit lens — “if we fired right now”</div>
+  <div class="lensSwitch" id="lensSwitch" style="display:none">
+    <button id="lensModeLogit" class="on">logit lens</button>
+    <button id="lensModeJ">J-lens</button>
+  </div>
   <div id="stepReadout"><span class="dot" style="background:var(--muted)"></span><span>waiting for a walk…</span></div>
   <div id="lens"></div>
   <div class="foot">
     Each point on the path is the residual stream after one more <b>+</b> (Euler step).
-    The bars show what the unembedding head would pick if the path stopped and fired
-    at the current point — watch the guess morph as layers bend the path.
+    <b>Logit lens</b>: what the head would pick if the path stopped and fired here.
+    <b>J-lens</b>: the state transported through the model's <i>average remaining
+    flow</i> (J<sub>ℓ</sub> = E[∂h<sub>final</sub>/∂h<sub>ℓ</sub>]) before decoding —
+    what it's disposed to make the model say <i>later</i>, the paper's window into
+    silent thoughts. Method: Anthropic, “Verbalizable Representations Form a Global
+    Workspace in Language Models”; lens files fitted &amp; hosted by Neuronpedia.
   </div>
 </aside>
 
@@ -387,6 +413,38 @@ $('patchAlpha').oninput = e => $('patchAlphaVal').textContent = Number(e.target.
 $('orbit').onchange = e => controls.autoRotate = e.target.checked;
 controls.autoRotate = $('orbit').checked;
 
+/* ---------- lens mode (logit vs Jacobian) ---------- */
+let lensMode = 'logit';
+let jlensAvailable = false;
+function setLensMode(m) {
+  lensMode = m;
+  $('lensModeLogit').classList.toggle('on', m === 'logit');
+  $('lensModeJ').classList.toggle('on', m === 'jlens');
+  $('lensTitle').textContent = m === 'jlens'
+    ? 'J-lens — “what it’s disposed to say”'
+    : 'Logit lens — “if we fired right now”';
+  if (current && lensState) updateLens(lensState.k);   // re-render the live step
+}
+$('lensModeLogit').onclick = () => setLensMode('logit');
+$('lensModeJ').onclick = () => setLensMode('jlens');
+$('patchMode').onchange = e => {
+  // an exact paper swap is alpha = 1; the nudge default pushes harder
+  const alpha = e.target.value === 'swap' ? '1.0' : '2.5';
+  $('patchAlpha').value = alpha;
+  $('patchAlphaVal').textContent = Number(alpha).toFixed(1);
+};
+
+/* configure the UI from the server before any walk */
+fetch('/api/info').then(r => r.json()).then(info => {
+  $('modelChip').textContent =
+    `${info.model} · ${info.n_layers} layers · ${info.hidden}-dim stream · ${info.device}`;
+  jlensAvailable = !!(info.jlens && info.jlens.available);
+  if (jlensAvailable) {
+    $('lensSwitch').style.display = 'flex';
+    $('patchSwapOpt').disabled = false;
+  }
+}).catch(() => {});
+
 /** Make control characters in a token visible without breaking layout. */
 function displayToken(t) {
   return t.replace(/\n/g, '⏎').replace(/^ /, '␣');
@@ -474,6 +532,7 @@ class TokenPath {
     this.coords = packet.coords;   // 33 rows of top-12 PCA coordinates
     this.positions = this.coords.map(() => new THREE.Vector3());
     this.lens = packet.lens;
+    this.jlens = packet.jlens || null;   // per-point rows, null where no transport
     this.chosen = packet.chosen;
     this.chosenProb = packet.chosen_prob;
     this.steps = steps;
@@ -685,7 +744,8 @@ function drawRecordingOverlay(ctx, w, h) {
     ctx.font = `${12 * s}px system-ui, sans-serif`;
     const where = info.kind === 'embed' ? 'embedding — the path begins'
       : `${info.kind === 'attn' ? 'attention' : 'MLP'} add · layer ${info.layer}`;
-    ctx.fillText(`step ${lensState.k}/${steps.length - 1} · ${where}`, textX + 16 * s, ty);
+    ctx.fillText(`step ${lensState.k}/${steps.length - 1} · ${where}` +
+      (lensState.usingJ ? ' · J-lens' : ''), textX + 16 * s, ty);
 
     const chipW = 96 * s, pctW = 46 * s;
     const trackX = textX + chipW + 8 * s;
@@ -717,7 +777,8 @@ function drawRecordingOverlay(ctx, w, h) {
     const parts = [];
     if (patchInfo.add) parts.push(`+${patchInfo.add.trim()}`);
     if (patchInfo.remove) parts.push(`−${patchInfo.remove.trim()}`);
-    ctx.fillText(`💉 nudge ${parts.join(' ')} @ layer ${patchInfo.layer} ×${patchInfo.alpha}`, textX, ty + 14 * s);
+    const verb = patchInfo.mode === 'swap' ? '🔁 J-swap' : '💉 nudge';
+    ctx.fillText(`${verb} ${parts.join(' ')} @ layer ${patchInfo.layer} ×${patchInfo.alpha}`, textX, ty + 14 * s);
     ty += 18 * s;
   }
   if (tourInfo) {
@@ -779,6 +840,11 @@ function resetWalk() {
 }
 
 function startWalk() {
+  if ($('patchOn').checked && $('patchMode').value === 'swap'
+      && (!$('patchAdd').value.trim() || !$('patchRemove').value.trim())) {
+    setStatus('J-swap trades two concepts — fill in both add and remove');
+    return;
+  }
   resetWalk();
   if ($('record').checked) startRecording();
   const prompt = $('prompt').value;
@@ -797,6 +863,7 @@ function startWalk() {
       patch: $('patchOn').checked ? {
         add: $('patchAdd').value.trim() || null,
         remove: $('patchRemove').value.trim() || null,
+        mode: $('patchMode').value,
         layer: Number($('patchLayer').value),
         alpha: Number($('patchAlpha').value),
       } : null,
@@ -855,7 +922,19 @@ function updateLens(k) {
   const info = steps[k];
   const dotColor = info.kind === 'embed' ? 'var(--embed)' : info.kind === 'attn' ? 'var(--attn)' : 'var(--mlp)';
   let where = info.kind === 'embed' ? 'embedding — the path begins' : `${info.kind === 'attn' ? 'attention' : 'MLP'} add · layer ${info.layer}`;
-  if (patchInfo?.active && k === patchInfo.step) where += ' · 💉 nudged!';
+  if (patchInfo?.active && k === patchInfo.step) {
+    where += patchInfo.mode === 'swap' ? ' · 🔁 swapped!' : ' · 💉 nudged!';
+  }
+
+  let rows = current.lens[k];
+  let usingJ = false;
+  if (lensMode === 'jlens' && current.jlens && current.jlens[k]) {
+    rows = current.jlens[k];
+    usingJ = true;
+  }
+  if (lensMode === 'jlens' && !usingJ) where += ' · no J transport — logit shown';
+  else if (usingJ) where += ' · J-lens';
+
   stepReadout.innerHTML = '';
   const dot = document.createElement('span');
   dot.className = 'dot'; dot.style.background = dotColor;
@@ -863,8 +942,7 @@ function updateLens(k) {
   txt.textContent = `step ${k}/${steps.length - 1} · ${where}`;
   stepReadout.append(dot, txt);
 
-  const rows = current.lens[k];
-  lensState = { k, info, rows };
+  lensState = { k, info, rows, usingJ };
   lensEl.innerHTML = '';
   rows.forEach((r, i) => {
     const row = document.createElement('div');
@@ -884,7 +962,7 @@ function updateLens(k) {
   guessEl.style.display = 'block';
   guessEl.classList.remove('fired');
   guessEl.innerHTML = '';
-  guessEl.append(displayToken(rows[0].t));
+  guessEl.append((usingJ ? 'J· ' : '') + displayToken(rows[0].t));
   const prob = document.createElement('span');
   prob.className = 'prob'; prob.textContent = `${(rows[0].p * 100).toFixed(0)}%`;
   guessEl.appendChild(prob);

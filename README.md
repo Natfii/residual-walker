@@ -58,6 +58,32 @@ on Linux/macOS the venv paths are `.venv/bin/...`.)
 Try `The capital of France is` at temperature 0 and watch "Paris" take over
 the lens partway through the layers — that's the retrieval moment.
 
+## The J-lens: watching silent thoughts
+
+For supported models the walker also carries a **Jacobian lens** (J-lens),
+from Anthropic's paper *Verbalizable Representations Form a Global Workspace
+in Language Models*. The logit lens asks *"what if the head fired right
+here?"* — near the final layers that collapses into the token about to be
+emitted (the paper's "motor regime"). The J-lens asks a different question:
+*"what is this state disposed to make the model say, eventually?"* It
+transports the state through the model's **average remaining flow** — one
+fitted matrix per layer, `J_l = E[∂h_final/∂h_l]`, averaged over a corpus —
+then decodes with the model's own unembedding. In the paper this readout
+surfaces intermediate reasoning steps, silent plans, and private assessments
+that never appear in the output.
+
+When a pre-fitted lens exists for the loaded model (fitted by
+[Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens) with
+Anthropic's [jlens](https://github.com/anthropics/jacobian-lens)), the
+walker downloads it automatically and a **logit / J-lens toggle** appears
+above the lens panel. Try `Fact: the number of legs on the animal that spins
+webs is` on Qwen3-1.7B and flip to the J-lens: *spider* surfaces mid-path —
+the stepping-stone the model thinks with but never says.
+
+Lens-ready models: **Qwen3 1.7B / 4B / 8B / 14B / 32B**, Qwen2.5-7B-Instruct,
+and Llama-3.1-8B(-Instruct). Point `RESIDUAL_WALKER_JLENS=<lens.pt>` at a
+lens you fitted yourself for anything else, or set it to `off` to disable.
+
 ## Grand tour & shadow honesty
 
 The 3D view is a *shadow* of the model's full hidden space (2048 dimensions
@@ -91,6 +117,14 @@ both matter, and you can see why.
 The PCA projection is always fit on the unpatched prompt, so a nudged walk
 and a clean walk of the same prompt render in the same coordinates — run
 both and compare the paths directly.
+
+When a J-lens is loaded, a second patch mode appears: **J-swap**, the paper's
+own intervention. Instead of pushing the state along a direction, it reads
+the state's coordinates in the frame of the two concepts' *J-lens vectors*
+(`v_w = J_lᵀ·u_w` — the unembedding row pulled back through the fitted
+transport), exchanges the two coordinates, and writes the result back,
+leaving everything orthogonal untouched. Concept A *becomes* concept B
+mid-flight; strength 1.0 is the exact swap.
 
 ## MP4 export
 

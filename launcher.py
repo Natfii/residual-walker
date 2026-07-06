@@ -42,9 +42,10 @@ CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
 CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 
 MODEL_PRESETS = [
-    ("unsloth/Llama-3.2-1B", "Llama 3.2 1B — fast, 16 layers, the default"),
+    ("Qwen/Qwen3-1.7B", "Qwen3 1.7B — 28 layers, pre-fitted J-lens ✓ (recommended)"),
+    ("unsloth/Llama-3.2-1B", "Llama 3.2 1B — fast, 16 layers, logit lens only"),
     ("unsloth/Llama-3.2-1B-Instruct", "Llama 3.2 1B Instruct — chat-tuned paths"),
-    ("unsloth/Llama-3.2-3B", "Llama 3.2 3B — 28 layers, richer but slower"),
+    ("Qwen/Qwen3-4B", "Qwen3 4B — richer paths, pre-fitted J-lens ✓"),
     ("Qwen/Qwen2.5-1.5B", "Qwen 2.5 1.5B — a different model family to compare"),
 ]
 

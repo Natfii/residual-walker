@@ -6,8 +6,18 @@ applies the logit lens at every point, projects the high-dimensional states
 to 3D with PCA, and streams one path per generated token to the browser
 over a WebSocket.
 
+For supported models a pre-fitted Jacobian lens (J-lens) is downloaded and
+applied alongside the logit lens: instead of asking "what if the head fired
+right now", the J-lens transports the state through the model's *average*
+remaining flow (J_l = E[dh_final/dh_l], one matrix per layer) before decoding
+— "what is this state disposed to make the model say later". Method and
+fitted lenses: Anthropic's "Verbalizable Representations Form a Global
+Workspace in Language Models" + github.com/anthropics/jacobian-lens; lens
+files fitted and hosted by Neuronpedia (neuronpedia/jacobian-lens).
+
 Run:  python server.py   →   http://127.0.0.1:8471
-Overrides:  RESIDUAL_WALKER_MODEL=<hf-repo-id>, RESIDUAL_WALKER_PORT=<port>.
+Overrides:  RESIDUAL_WALKER_MODEL=<hf-repo-id>, RESIDUAL_WALKER_PORT=<port>,
+            RESIDUAL_WALKER_JLENS=auto|off|<path-to-lens.pt>.
 """
 
 import asyncio
@@ -28,6 +38,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_ID = os.environ.get("RESIDUAL_WALKER_MODEL", "unsloth/Llama-3.2-1B")
 PORT = int(os.environ.get("RESIDUAL_WALKER_PORT", "8471"))
+JLENS_SPEC = os.environ.get("RESIDUAL_WALKER_JLENS", "auto")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 SCENE_RADIUS = 42.0  # world units the prompt's projected states are scaled into
@@ -35,6 +46,35 @@ TOUR_DIMS = 12       # PCA components sent to the browser for the grand tour
 LENS_TOP_K = 5
 MAX_NEW_TOKENS_CAP = 48
 SAMPLE_TOP_K = 50
+
+# Pre-fitted Jacobian lenses (Neuronpedia, fitted with Anthropic's jlens on
+# wikitext). Keyed by lowercased repo basename so mirrors match too; values
+# are the file paths inside JLENS_REPO. Only models whose blocks the recorder
+# reconstructs exactly (plain pre-norm attn/mlp) are listed — qwen3.5/3.6
+# lenses exist but those are hybrid architectures the recorder can't walk.
+JLENS_REPO = "neuronpedia/jacobian-lens"
+# Pin the exact revision so a mutable Hub repo can't swap lens contents under
+# us (torch.load(weights_only=True) blocks code execution, not content drift).
+# Bump deliberately after inspecting upstream changes.
+JLENS_REVISION = "5003e6ecd11bb085e2129d7411800b95074e4682"  # 2026-07-02
+
+
+def _jlens_file(folder, base):
+    return f"{folder}/jlens/Salesforce-wikitext/{base}_jacobian_lens.pt"
+
+
+JLENS_MODELS = {
+    "llama-3.1-8b": _jlens_file("llama3.1-8b", "Llama-3.1-8B"),
+    "meta-llama-3.1-8b": _jlens_file("llama3.1-8b", "Llama-3.1-8B"),
+    "llama-3.1-8b-instruct": _jlens_file("llama3.1-8b-it", "Llama-3.1-8B-Instruct"),
+    "meta-llama-3.1-8b-instruct": _jlens_file("llama3.1-8b-it", "Llama-3.1-8B-Instruct"),
+    "qwen2.5-7b-instruct": _jlens_file("qwen2.5-7b-it", "Qwen2.5-7B-Instruct"),
+    "qwen3-1.7b": _jlens_file("qwen3-1.7b", "Qwen3-1.7B"),
+    "qwen3-4b": _jlens_file("qwen3-4b", "Qwen3-4B"),
+    "qwen3-8b": _jlens_file("qwen3-8b", "Qwen3-8B"),
+    "qwen3-14b": _jlens_file("qwen3-14b", "Qwen3-14B"),
+    "qwen3-32b": _jlens_file("qwen3-32b", "Qwen3-32B"),
+}
 
 
 class ResidualRecorder:
@@ -114,24 +154,72 @@ class Walker:
         self.recorder = ResidualRecorder(self.model)
         self.n_layers = self.model.config.num_hidden_layers
         self.hidden = self.model.config.hidden_size
+        self.jlens = self._load_jlens()
         print(f"[residual-walker] ready: {self.n_layers} layers, hidden={self.hidden}")
+
+    def _load_jlens(self):
+        """Load the Jacobian lens for MODEL_ID: {layer: J_l tensor} or None.
+
+        J_l maps the residual at layer l's block output into the final-layer
+        basis (fitted as the corpus-average Jacobian E[dh_final/dh_l]). Any
+        failure downgrades to logit-lens-only rather than blocking the walk.
+        """
+        if JLENS_SPEC.lower() in ("off", "0", "none", ""):
+            return None
+        try:
+            if JLENS_SPEC != "auto":
+                path, source = JLENS_SPEC, JLENS_SPEC
+            else:
+                fname = JLENS_MODELS.get(MODEL_ID.split("/")[-1].lower())
+                if fname is None:
+                    print(f"[residual-walker] no pre-fitted J-lens known for {MODEL_ID} "
+                          "(logit lens only; set RESIDUAL_WALKER_JLENS=<lens.pt> to supply one)")
+                    return None
+                from huggingface_hub import hf_hub_download
+                print(f"[residual-walker] fetching J-lens {JLENS_REPO}/{fname} "
+                      f"@ {JLENS_REVISION[:12]} ...")
+                path = hf_hub_download(JLENS_REPO, fname, revision=JLENS_REVISION)
+                source = f"{JLENS_REPO}:{fname.split('/')[0]}@{JLENS_REVISION[:12]}"
+            ckpt = torch.load(path, map_location="cpu", weights_only=True)
+            if ckpt.get("d_model") != self.hidden:
+                print(f"[residual-walker] J-lens d_model={ckpt.get('d_model')} != "
+                      f"model hidden={self.hidden}; skipping")
+                return None
+            jacobians = {int(l): j.to(DEVICE, DTYPE) for l, j in ckpt["J"].items()}
+            print(f"[residual-walker] J-lens ready: {len(jacobians)} layers from {source}")
+            return {"J": jacobians, "source": source}
+        except Exception as err:
+            print(f"[residual-walker] J-lens unavailable ({type(err).__name__}: {err}); "
+                  "continuing with logit lens only")
+            return None
 
     @torch.inference_mode()
     def forward_states(self, input_ids, patch=None):
         """Full forward pass; returns residual stream states [n_points, seq, hidden].
 
-        patch = {"layer": int, "alpha": float, "unit": tensor[hidden]} steers the
-        stream at the last position right after that layer's block — the
-        spider→ant experiment: h += alpha * ||h|| * unit_direction.
+        patch steers the stream at the last position right after that layer's
+        block. Two modes:
+          {"mode": "nudge", "layer", "alpha", "unit"} — the spider→ant push:
+              h += alpha * ||h|| * unit_direction.
+          {"mode": "swap", "layer", "alpha", "basis"} — paper-style J-space
+              swap: permute the state's coordinates in the two-J-lens-vector
+              frame (basis [hidden, 2]); alpha=1 is the exact swap.
         """
         self.recorder.reset()
         handle = None
         if patch is not None:
-            recorder, alpha, unit = self.recorder, patch["alpha"], patch["unit"]
+            recorder, alpha = self.recorder, patch["alpha"]
 
             def steer_hook(module, inputs, output):
                 h = output[0] if isinstance(output, tuple) else output
-                vec = alpha * h[0, -1, :].norm() * unit
+                if patch["mode"] == "swap":
+                    x = h[0, -1, :].float()
+                    V = patch["basis"]
+                    gram = V.T @ V + 1e-6 * torch.eye(2, device=V.device)
+                    coords = torch.linalg.solve(gram, V.T @ x)
+                    vec = (alpha * (V @ (coords.flip(0) - coords))).to(h.dtype)
+                else:
+                    vec = alpha * h[0, -1, :].norm() * patch["unit"]
                 h = h.clone()
                 h[0, -1, :] += vec
                 recorder.patch_vec = vec.detach()
@@ -184,6 +272,61 @@ class Walker:
         """
         normed = self.model.model.norm(path_states)
         return self.model.lm_head(normed).float()
+
+    @torch.inference_mode()
+    def jlens_logits(self, path_states):
+        """J-lens: transport each point into the final-layer basis with its
+        block's J_l, then the same norm + unembed as the logit lens.
+
+        Points map to the enclosing block: attn-add and mlp-add of layer l both
+        use J_l (the attn midpoint has no fitted transport of its own; J_l is
+        the nearest, off by that layer's MLP). The embedding point precedes
+        block 0 and gets no readout. Fitted lenses omit the final block, whose
+        transport is the identity by construction — there the J-lens IS the
+        logit lens. Returns a list aligned with path points: [vocab] float32
+        tensors, or None where no transport exists.
+        """
+        out = [None] * path_states.shape[0]
+        if self.jlens is None:
+            return out
+        for k in range(1, path_states.shape[0]):
+            layer = (k - 1) // 2
+            J = self.jlens["J"].get(layer)
+            if J is not None:
+                transported = (path_states[k].float() @ J.T.float()).to(DTYPE)
+            elif layer == self.n_layers - 1:
+                transported = path_states[k]   # end of the flow: J = identity
+            else:
+                continue
+            out[k] = self.model.lm_head(self.model.model.norm(transported)).float()
+        return out
+
+    def swap_basis(self, add_text, remove_text, layer):
+        """Basis for a paper-style J-space swap at `layer`: the two J-lens
+        vectors v_w = J_l^T u_w (u_w = unembedding row), stacked [hidden, 2].
+
+        The swap permutes the state's coordinates in this frame and leaves the
+        orthogonal complement untouched — concept A becomes concept B and vice
+        versa, rather than just shoving the state along a direction.
+        Returns (V, add_tok, remove_tok); V is None if the lens, the layer, or
+        either token is unavailable.
+        """
+        if self.jlens is None or layer not in self.jlens["J"]:
+            return None, None, None
+
+        def first_id(text):
+            ids = self.tokenizer.encode(" " + (text or "").strip(), add_special_tokens=False)
+            return (ids[0], self.tokenizer.decode([ids[0]])) if ids else (None, None)
+
+        a_id, a_tok = first_id(add_text)
+        b_id, b_tok = first_id(remove_text)
+        if a_id is None or b_id is None:
+            return None, a_tok, b_tok
+        J = self.jlens["J"][layer].float()
+        u = self.model.lm_head.weight
+        v_a = J.T @ u[a_id].float()
+        v_b = J.T @ u[b_id].float()
+        return torch.stack([v_a, v_b], dim=1), a_tok, b_tok
 
     def fit_projection(self, states):
         """Fit a PCA basis + scene scale on the prompt's states so every path in
@@ -245,6 +388,19 @@ async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/api/info")
+async def info():
+    """Model + lens availability, so the UI can configure itself before a walk."""
+    return {
+        "model": MODEL_ID,
+        "device": torch.cuda.get_device_name(0) if DEVICE == "cuda" else "CPU",
+        "n_layers": walker.n_layers,
+        "hidden": walker.hidden,
+        "jlens": {"available": walker.jlens is not None,
+                  "source": walker.jlens["source"] if walker.jlens else None},
+    }
+
+
 @app.post("/export")
 async def export_walk(request: Request):
     """Transcode a browser-recorded walk (WebM) to MP4 — NVENC first, CPU fallback."""
@@ -279,8 +435,18 @@ def token_text(tokenizer, token_id):
     return tokenizer.decode([token_id])
 
 
+def _top_rows(tokenizer, logits):
+    """[vocab] logits → top-K [{t, p}] rows for the lens panel."""
+    probs = torch.softmax(logits, dim=-1)
+    top = probs.topk(LENS_TOP_K, dim=-1)
+    return [
+        {"t": token_text(tokenizer, int(i)), "p": round(float(p), 4)}
+        for i, p in zip(top.indices, top.values)
+    ]
+
+
 def build_packet(walker, path_states, pca, scale, temperature, token_index):
-    """Assemble one token's path packet: 3D points, logit lens, sampled token."""
+    """Assemble one token's path packet: 3D points, both lenses, sampled token."""
     coords = pca.transform(path_states.float().cpu().numpy()) * scale
     logits = walker.lens_logits(path_states)
     probs = torch.softmax(logits, dim=-1)
@@ -292,12 +458,19 @@ def build_packet(walker, path_states, pca, scale, temperature, token_index):
         ]
         for row_ids, row_ps in zip(top.indices, top.values)
     ]
+    jlens = None
+    if walker.jlens is not None:
+        jlens = [
+            _top_rows(walker.tokenizer, row) if row is not None else None
+            for row in walker.jlens_logits(path_states)
+        ]
     next_id = walker.sample(logits[-1], temperature)
     return {
         "type": "path",
         "index": token_index,
         "coords": [[round(float(c), 3) for c in row] for row in coords],
         "lens": lens,
+        "jlens": jlens,
         "chosen": token_text(walker.tokenizer, next_id),
         "chosen_prob": round(float(probs[-1, next_id]), 4),
     }, next_id
@@ -324,13 +497,22 @@ async def walk(ws: WebSocket):
             if patch_req.get("add") or patch_req.get("remove"):
                 layer = max(0, min(walker.n_layers - 1, int(patch_req.get("layer", walker.n_layers // 2))))
                 alpha = max(0.0, min(6.0, float(patch_req.get("alpha", 1.5))))
-                unit, add_tok, remove_tok = walker.steer_direction(
-                    patch_req.get("add"), patch_req.get("remove")
-                )
-                if unit is not None and alpha > 0:
-                    patch = {"layer": layer, "alpha": alpha, "unit": unit}
+                mode = str(patch_req.get("mode", "nudge"))
+                if mode == "swap":
+                    basis, add_tok, remove_tok = walker.swap_basis(
+                        patch_req.get("add"), patch_req.get("remove"), layer
+                    )
+                    if basis is not None and alpha > 0:
+                        patch = {"mode": "swap", "layer": layer, "alpha": alpha, "basis": basis}
+                else:
+                    unit, add_tok, remove_tok = walker.steer_direction(
+                        patch_req.get("add"), patch_req.get("remove")
+                    )
+                    if unit is not None and alpha > 0:
+                        patch = {"mode": "nudge", "layer": layer, "alpha": alpha, "unit": unit}
+                if patch is not None:
                     patch_echo = {
-                        "active": True, "add": add_tok, "remove": remove_tok,
+                        "active": True, "mode": mode, "add": add_tok, "remove": remove_tok,
                         "layer": layer, "alpha": alpha, "step": 2 * layer + 2,
                     }
 
@@ -348,6 +530,8 @@ async def walk(ws: WebSocket):
                 "device": torch.cuda.get_device_name(0) if DEVICE == "cuda" else "CPU",
                 "n_layers": walker.n_layers,
                 "hidden": walker.hidden,
+                "jlens": {"available": walker.jlens is not None,
+                          "source": walker.jlens["source"] if walker.jlens else None},
                 "steps": walker.step_kinds(),
                 "tour": {
                     "dims": int(pca.n_components_),
