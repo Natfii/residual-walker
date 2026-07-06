@@ -96,6 +96,7 @@
     border-left: 1px solid var(--border);
     padding: 18px 18px 28px;
     overflow-y: auto;
+    overflow-x: hidden;
     display: flex; flex-direction: column; gap: 14px;
   }
   h1 { font-size: 17px; font-weight: 700; }
@@ -153,6 +154,8 @@
     font-size: 13.5px;
     line-height: 1.55;
     min-height: 58px;
+    max-height: 140px;
+    overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-word;
   }
@@ -210,12 +213,21 @@
     border-radius: 6px; padding: 6px 8px; font-size: 12px;
   }
 
-  #promptTokens { font-size: 11px; color: var(--muted); line-height: 1.9; }
+  #promptDetails summary {
+    font-size: 11px; color: var(--muted); cursor: pointer;
+    user-select: none; list-style-position: inside;
+  }
+  #promptDetails summary:hover { color: var(--ink-2); }
+  #promptTokens {
+    font-size: 11px; color: var(--muted); line-height: 1.9;
+    max-height: 96px; overflow-y: auto; overflow-wrap: anywhere;
+    margin-top: 4px;
+  }
   #promptTokens code {
     font-family: ui-monospace, Consolas, monospace;
     background: var(--page); border: 1px solid var(--border);
     border-radius: 4px; padding: 1px 5px; margin-right: 4px;
-    white-space: pre;
+    white-space: pre-wrap;
   }
   .foot { font-size: 11px; color: var(--muted); line-height: 1.5; }
 </style>
@@ -305,7 +317,10 @@
 
   <div class="sectionTitle">Story so far</div>
   <div id="story"><span class="prompt"></span></div>
-  <div id="promptTokens"></div>
+  <details id="promptDetails" style="display:none">
+    <summary id="promptSummary">prompt tokens</summary>
+    <div id="promptTokens"></div>
+  </details>
 
   <div class="sectionTitle" id="lensTitle">Logit lens — “if we fired right now”</div>
   <div class="lensSwitch" id="lensSwitch" style="display:none">
@@ -709,7 +724,12 @@ function compositeFrame() {
 
 function trimLeft(ctx, text, maxW) {
   if (ctx.measureText(text).width <= maxW) return text;
+  // jump-cut near the target length first — the char-by-char loop alone costs
+  // hundreds of measureText calls per frame once generations get long
   let t = text;
+  const avg = ctx.measureText(t).width / t.length;
+  const keep = Math.min(t.length, Math.ceil((maxW / avg) * 1.4) + 2);
+  t = t.slice(t.length - keep);
   while (t.length > 1 && ctx.measureText('…' + t).width > maxW) t = t.slice(1);
   return '…' + t;
 }
@@ -740,15 +760,16 @@ function drawRecordingOverlay(ctx, w, h) {
   const textX = x + pad, maxW = cardW - pad * 2;
   let ty = y + pad + 12 * s;
 
-  /* story line: prompt in secondary ink, generated tokens bold white,
-     trimmed from the left so the newest words stay on screen */
+  /* story line: prompt in secondary ink, generated tokens bold white; the
+     generation claims its width first, the prompt left-trims into what's left,
+     so the newest words always stay on film */
   ctx.font = `600 ${13.5 * s}px system-ui, sans-serif`;
-  let gen = genText, pr = promptText;
-  while (pr.length && ctx.measureText(pr).width + ctx.measureText(gen).width > maxW) pr = pr.slice(1);
-  if (!pr.length) gen = trimLeft(ctx, gen, maxW);
-  else if (pr !== promptText) pr = '…' + pr.slice(1);
-  ctx.fillStyle = '#c3c2b7';
+  const gen = trimLeft(ctx, genText, maxW);
+  const genW = ctx.measureText(gen).width;
   ctx.font = `${13.5 * s}px system-ui, sans-serif`;
+  const prRoom = maxW - genW - 4 * s;
+  const pr = prRoom > 12 * s ? trimLeft(ctx, promptText, prRoom) : '';
+  ctx.fillStyle = '#c3c2b7';
   ctx.fillText(pr, textX, ty);
   const prW = ctx.measureText(pr).width;
   ctx.fillStyle = '#ffffff';
@@ -852,6 +873,8 @@ function resetWalk() {
   guessEl.classList.remove('fired');
   storyEl.innerHTML = '';
   $('promptTokens').textContent = '';
+  $('promptDetails').style.display = 'none';
+  $('promptDetails').open = false;
   lensEl.innerHTML = '';
   stepReadout.innerHTML = '';
   $('export').textContent = '';
@@ -902,12 +925,14 @@ function startWalk() {
       document.getElementById('shadowMeter').style.display = 'block';
       $('modelChip').textContent = `${msg.model} · ${msg.n_layers} layers · ${msg.hidden}-dim stream · ${msg.device}`;
       const pt = $('promptTokens');
-      pt.append('prompt tokens: ');
+      pt.innerHTML = '';
       for (const t of msg.prompt_tokens) {
         const c = document.createElement('code');
         c.textContent = displayToken(t);
         pt.appendChild(c);
       }
+      $('promptSummary').textContent = `prompt tokens (${msg.prompt_tokens.length})`;
+      $('promptDetails').style.display = 'block';
     } else if (msg.type === 'path') {
       queue.push(msg);
     } else if (msg.type === 'done') {
@@ -1007,6 +1032,7 @@ function finishCurrent(withEffects = true) {
   span.className = 'gen flash';
   span.textContent = current.chosen;
   storyEl.appendChild(span);
+  storyEl.scrollTop = storyEl.scrollHeight;   // keep the newest words in view
   genText += current.chosen;
   paths.push(current);
   current = null;
