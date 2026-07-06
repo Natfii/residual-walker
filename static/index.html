@@ -368,10 +368,9 @@ const grid = new THREE.GridHelper(280, 28, 0x2c2c2a, 0x1f1f1e);
 grid.position.y = -58;
 scene.add(grid);
 
-/* shared materials — one per step kind, plus ghosts */
+/* shared line materials — step-kind colors ride in the vertex-color buffer */
 const lineMats = {
-  attn:  new LineMaterial({ color: COLORS.attn, linewidth: 3 }),
-  mlp:   new LineMaterial({ color: COLORS.mlp, linewidth: 3 }),
+  path:  new LineMaterial({ vertexColors: true, linewidth: 3 }),
   ghost: new LineMaterial({ color: COLORS.ghost, linewidth: 1.6, transparent: true, opacity: 0.28 }),
 };
 const sphereGeo = new THREE.SphereGeometry(0.62, 20, 14);
@@ -526,10 +525,15 @@ function makeLabelSprite(text) {
   return sprite;
 }
 
-/* ---------- one token's path ---------- */
+/* ---------- one token's path ----------
+ * The whole path is ONE Line2: reveal advances geometry.instanceCount, the
+ * grand tour rewrites the existing position buffer in place, and step-kind
+ * colors are baked once into the vertex-color buffer. (A per-segment Line2
+ * design froze the tab: touring re-allocated GPU buffers for every segment
+ * of every path on every frame.) */
 class TokenPath {
   constructor(packet, steps) {
-    this.coords = packet.coords;   // 33 rows of top-12 PCA coordinates
+    this.coords = packet.coords;   // rows of top-12 PCA coordinates
     this.positions = this.coords.map(() => new THREE.Vector3());
     this.lens = packet.lens;
     this.jlens = packet.jlens || null;   // per-point rows, null where no transport
@@ -538,25 +542,47 @@ class TokenPath {
     this.steps = steps;
     this.revealed = 0;             // number of points currently visible
     this.group = new THREE.Group();
-    this.segments = [];
     this.spheres = [];
     this.endSphere = null;
     this.labelSprite = null;
+
+    const n = this.coords.length;
+    const geo = new LineGeometry();
+    geo.setPositions(new Array(n * 3).fill(0));
+    geo.setColors(new Array(n * 3).fill(1));
+    const colorArr = geo.attributes.instanceColorStart.data.array;
+    const c = new THREE.Color();
+    for (let seg = 0; seg < n - 1; seg++) {
+      c.set(COLORS[this.steps[seg + 1].kind]);  // solid, colored by destination step
+      colorArr.set([c.r, c.g, c.b, c.r, c.g, c.b], seg * 6);
+    }
+    geo.instanceCount = 0;
+    this.line = new Line2(geo, lineMats.path);
+    this.line.frustumCulled = false;
+    this.group.add(this.line);
+
     this.refreshPositions();
     scene.add(this.group);
   }
 
   /** Re-project every point through the current frame and move all geometry.
-   *  Called on reveal and whenever the grand tour turns the frame. */
+   *  Called on reveal and every frame the grand tour turns — so it must not
+   *  allocate: it rewrites the line's existing interleaved buffer. */
   refreshPositions() {
-    for (let i = 0; i < this.coords.length; i++) {
+    const n = this.coords.length;
+    for (let i = 0; i < n; i++) {
       projectPoint(this.coords[i], this.positions[i]);
     }
-    for (const s of this.spheres) s.position.copy(this.positions[s.userData.idx]);
-    for (const seg of this.segments) {
-      const a = this.positions[seg.userData.a], b = this.positions[seg.userData.b];
-      seg.geometry.setPositions([a.x, a.y, a.z, b.x, b.y, b.z]);
+    const buf = this.line.geometry.attributes.instanceStart.data;
+    const arr = buf.array;
+    for (let seg = 0; seg < n - 1; seg++) {
+      const a = this.positions[seg], b = this.positions[seg + 1];
+      const o = seg * 6;
+      arr[o] = a.x; arr[o + 1] = a.y; arr[o + 2] = a.z;
+      arr[o + 3] = b.x; arr[o + 4] = b.y; arr[o + 5] = b.z;
     }
+    buf.needsUpdate = true;
+    for (const s of this.spheres) s.position.copy(this.positions[s.userData.idx]);
     if (this.endSphere) {
       const end = this.positions[this.positions.length - 1];
       this.endSphere.position.copy(end);
@@ -575,15 +601,7 @@ class TokenPath {
       this.group.add(start);
       this.spheres.push(start);
     } else {
-      const a = this.positions[k - 1], b = this.positions[k];
-      const geo = new LineGeometry();
-      geo.setPositions([a.x, a.y, a.z, b.x, b.y, b.z]);
-      const seg = new Line2(geo, lineMats[kind]);
-      seg.computeLineDistances();
-      seg.userData.a = k - 1;
-      seg.userData.b = k;
-      this.group.add(seg);
-      this.segments.push(seg);
+      this.line.geometry.instanceCount = k;   // k revealed segments
       const isNudge = patchInfo?.active && k === patchInfo.step;
       const dot = isNudge
         ? new THREE.Mesh(patchGeo, patchMat)
@@ -604,7 +622,7 @@ class TokenPath {
   /** Collapse a finished path into a faint gray trail with a token label. */
   ghost() {
     if (this.endSphere) return;
-    for (const seg of this.segments) seg.material = lineMats.ghost;
+    this.line.material = lineMats.ghost;
     for (const s of this.spheres) { this.group.remove(s); }
     this.spheres.length = 0;
     const end = new THREE.Mesh(sphereGeo, sphereMats.ghost);
@@ -619,7 +637,11 @@ class TokenPath {
 
   dispose() {
     scene.remove(this.group);
-    this.group.traverse(o => { if (o.geometry && o.geometry !== sphereGeo && o.geometry !== embedGeo) o.geometry.dispose(); });
+    this.group.traverse(o => {
+      if (o.geometry && o.geometry !== sphereGeo && o.geometry !== embedGeo && o.geometry !== patchGeo) {
+        o.geometry.dispose();
+      }
+    });
   }
 }
 
