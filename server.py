@@ -388,7 +388,9 @@ app.mount("/exports", StaticFiles(directory=EXPORTS_DIR), name="exports")
 
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    # no-cache: the frontend and the WS protocol version together, so a stale
+    # cached page must never talk to a newer server
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/info")
