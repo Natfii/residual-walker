@@ -14,15 +14,10 @@ path growing in your browser. At every point it applies the **logit lens**
 (final norm + unembedding) so you can watch which token the model *would*
 pick if the path stopped there.
 
-It's built for getting an intuition you can't get from equations: what
-retrieval looks like, where attention actually reads from, how steering
-bends a trajectory, and why depth and dose matter. No training, no
-notebooks — a prompt box and a 3D scene.
-
 ## Quick start
 
 **Windows, no Python needed** — grab `ResidualWalker.exe` (from the repo's
-Releases page or build it yourself, below), drop it in this folder,
+Releases page), drop it in this folder,
 double-click. First run bootstraps everything: a private Python environment,
 the right PyTorch build (CUDA if you have an NVIDIA GPU, CPU otherwise), and
 a model of your choice from a picker. Later runs go straight to launch.
@@ -33,8 +28,7 @@ a model of your choice from a picker. Later runs go straight to launch.
 python launcher.py
 ```
 
-Same bootstrap, same picker. The browser opens automatically when the
-server is ready.
+The browser opens automatically when the server is ready.
 
 **Fully manual** (if you'd rather own the environment):
 
@@ -49,12 +43,10 @@ on Linux/macOS the venv paths are `.venv/bin/...`.)
 
 **Which model?** Start with the picker's default, **Llama 3.2 1B**: it packs
 its compute into 16 layers, so every Euler step is big and the paths launch
-like fireworks — that's the look in the gif above. Qwen3 models spread the
+like fireworks. Qwen3 models spread the
 same work over more, gentler layers (comet trails instead of rockets) and
-bring a pre-fitted J-lens. Watching the *same prompt* on both families is a
-great first experiment: every model thinks in its own coordinate system, but
-the choreography — how big the steps are and where in the stack they land —
-is a genuine signature.
+bring a pre-fitted **J-lens**. Watching the *same prompt* on both families is a
+great first experiment: every model thinks in its own coordinate system.
 
 ## What you're looking at
 
@@ -75,7 +67,7 @@ the lens partway through the layers — that's the retrieval moment.
 
 **Everything is clickable.** Click any sphere on the path to pause and park
 the lens there; click a **generated token in the story box** to jump to the
-walk that fired it (it lights up blue on hover); scrub with **←/→** — even
+walk that fired it (it lights up blue on hover); scrub with **←/→** even
 after the walk is done. The whole scene is one linked selection: lens,
 inspector, and arcs always describe the same point.
 
@@ -83,9 +75,7 @@ inspector, and arcs always describe the same point.
 
 A transformer token's walk is private except for one channel: at every
 layer, each token publishes a **key** and **value** computed from its
-current state, and every later token's attention reads that board. That
-horizontal flow (it's exactly what the KV cache stores) is invisible in most
-visualizations — here it's the purple layer of the scene.
+current state, and every later token's attention reads that board. 
 
 Tick **🟣 k/v stream** and every attention add sprouts arcs from the tokens
 it read, weight riding in brightness, with a pulse traveling along each arc
@@ -94,13 +84,9 @@ the arcs have somewhere to come from. The arc geometry is honest: each arc
 leaves from the source token's state *entering* that layer — the exact
 vector its k/v were computed from — and lands on the reader's attention add.
 
-Try it on the Paris prompt: mid-stack, a fat arc locks onto " France" and
-stays locked while the lens converges on " Paris". You're watching the
-model look the answer up.
-
-(Position 0 is omitted from arcs on purpose — it's the attention sink, a
+(Position 0 is omitted from arcs on purpose, it's the attention sink, a
 parking spot that soaks up default attention mass. Weights therefore don't
-sum to 1; that's honesty, not a bug.)
+sum to 1)
 
 ## The point inspector — q/k/v under the microscope
 
@@ -141,16 +127,6 @@ Anthropic's [jlens](https://github.com/anthropics/jacobian-lens)), the
 walker downloads it automatically and a **logit / J-lens toggle** appears
 above the lens panel.
 
-**Try it** (Qwen3-1.7B): walk `The capital of the country where the Eiffel
-Tower stands is` and flip to the J-lens mid-path — it reads *capital* →
-*this city* → *city* while the logit lens still shows noise: the model knows
-**what kind of thing** it will say before it knows the word. Two notes at
-small scale: on bilingual models the J-lens often voices dispositions in
-Chinese tokens (首都 = capital — that's the concept space being
-multilingual, not a bug), and the paper's spider-legs demo needs a bigger
-model — 1.7B never resolves the two-hop riddle at all, so there's no silent
-*spider* to see. Try Qwen3-4B or 8B.
-
 Lens-ready models: **Qwen3 1.7B / 4B / 8B / 14B / 32B**, Qwen2.5-7B-Instruct,
 and Llama-3.1-8B(-Instruct). Point `RESIDUAL_WALKER_JLENS=<lens.pt>` at a
 lens you fitted yourself for anything else, or set it to `off` to disable.
@@ -179,19 +155,10 @@ home: pick an **add concept** and/or **remove concept**, a layer, and a
 strength, tick **inject during walks**, and every generated token gets a
 steering vector `strength · ‖h‖ · unit(add − remove)` added to its residual
 stream right after that layer (built from the concepts' unembedding rows).
-A violet diamond marks the nudge point on the path — watch the trajectory
-kink there and the logit lens flip downstream.
-
-**The classic demo**: prompt `The capital of France is`, temperature 0, add
-`China`, remove `France`, layer 4, strength 2.5 → the model answers
-**Beijing**. It doesn't parrot the injected word — downstream layers
-*compute with* the swapped concept. Nudge too late (last few layers) or too
-hard and it degrades into parroting (" China China China"): depth and dose
-both matter, and you can see why.
+A violet diamond marks the nudge point on the path.
 
 The PCA projection is always fit on the unpatched prompt, so a nudged walk
-and a clean walk of the same prompt render in the same coordinates — run
-both and compare the paths directly.
+and a clean walk of the same prompt render in the same coordinates.
 
 **Whole phrases work too** — a multi-token concept switches the nudge to
 activation-based directions (ActAdd/CAA style): the phrase is run through
@@ -200,11 +167,7 @@ steering direction (the export overlay marks these runs "phrase vibes").
 One craft note: a lone phrase mostly carries generic "phrase-ness" and acts
 like an unlabeled kick. The real technique is a **contrast pair** — matched
 phrases in *add* and *remove* so everything shared cancels and only the
-difference steers. **Example to try** (Qwen3-4B): add *"La capitale de la
-France est une belle ville magnifique"*, remove the same sentence in
-English, sticky 1→10 — at strength 0.1 Franglais leaks in ("The capitale de
-France is"), at 0.2 the model answers in French ("la ville de la France"),
-by 0.35 it breaks. The language direction, isolated by subtraction.
+difference steers. 
 
 **Sticky steering** — tick *sticky* to re-apply the patch at every layer
 from *at layer* through *to layer* (defaults to the ¾ mark: re-injecting in
@@ -212,11 +175,7 @@ the final "motor zone" layers just parrots the token instead of steering the
 thought). One-shot early nudges get healed by the network's self-repair;
 sticky ones outrun it — this is how Golden-Gate-style continuous steering
 works. It compounds hard across the range, so the steering window is tiny
-and finding it is the game. **Example to try** (Qwen3-1.7B): `+China
-−France` sticky over layers 2→20 flips "The capital of France is" to
-**Beijing** at strength 0.05–0.08, degrades to parroting "China" by 0.12,
-and collapses into whitespace by 0.2. A violet diamond rail marks the
-patched range on the path.
+and finding it is the game. 
 
 When a J-lens is loaded, a second patch mode appears: **J-swap**, modeled on
 the paper's intervention. Instead of pushing the state along a direction, it
@@ -226,21 +185,13 @@ fitted transport), exchanges the two coordinates at **every position**, and
 writes the result back, leaving everything orthogonal untouched. Strength
 1.0 is the exact swap.
 
-**What to expect**: at small scale the exact swap usually **loses** — even
-France↔Italy at every position and 3× overdrive cannot move "The capital of
-France is" off Paris, while the crude nudge flips it easily. A concept's
-mid-layer representation is far richer than its single
-"will-eventually-say-this-word" readout direction, and the network routes
-around a rank-2 edit. Watching the surgical swap fail where the sledgehammer
-succeeds is itself a lesson about distributed representations (and about
-why the paper's swaps were done on much larger models).
 
 ## MP4 export
 
 Tick **⏺ record walk → MP4** before hitting Walk. The scene is recorded
 live (including your own camera moves and the k/v arcs) with an overlay card
 carrying the prompt, the story so far, the step readout, and the logit-lens
-bars — so exports tell the whole story on their own. When the walk ends the
+bars. When the walk ends the
 server transcodes with NVENC on the GPU (CPU x264 fallback) and a download
 link appears; files land in `exports/`. Requires `ffmpeg` on your PATH.
 
