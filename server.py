@@ -44,6 +44,8 @@ DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 SCENE_RADIUS = 42.0  # world units the prompt's projected states are scaled into
 TOUR_DIMS = 12       # PCA components sent to the browser for the grand tour
 LENS_TOP_K = 5
+ATTN_TOP_K = 8       # arc sources shipped per attention point
+ATTN_MIN_W = 0.02    # weights below this never make an arc
 MAX_NEW_TOKENS_CAP = 200
 SAMPLE_TOP_K = 50
 
@@ -91,10 +93,15 @@ class ResidualRecorder:
         self.attn_deltas = []
         self.mlp_deltas = []
         self.patch_vecs = {}        # {layer: steering vector applied this forward}
+        self.qkv_staging = {"q": {}, "k": {}, "v": {}}  # {key: {layer: [1, seq, heads*dim]}}
         model.model.embed_tokens.register_forward_hook(self._grab_embed)
-        for layer in model.model.layers:
+        for idx, layer in enumerate(model.model.layers):
             layer.self_attn.register_forward_hook(self._grab_attn)
             layer.mlp.register_forward_hook(self._grab_mlp)
+            for key in ("q", "k", "v"):
+                getattr(layer.self_attn, f"{key}_proj").register_forward_hook(
+                    self._grab_qkv(key, idx)
+                )
 
     def _grab_embed(self, module, inputs, output):
         self.embed_out = output.detach()
@@ -106,11 +113,19 @@ class ResidualRecorder:
     def _grab_mlp(self, module, inputs, output):
         self.mlp_deltas.append(output.detach())
 
+    def _grab_qkv(self, key, layer_idx):
+        """Hook factory for q/k/v projection outputs, keyed by explicit layer."""
+        def hook(module, inputs, output):
+            self.qkv_staging[key][layer_idx] = output.detach()
+        return hook
+
     def reset(self):
         self.embed_out = None
         self.attn_deltas.clear()
         self.mlp_deltas.clear()
         self.patch_vecs.clear()
+        for staged in self.qkv_staging.values():
+            staged.clear()
 
     def stream_states(self):
         """Rebuild the residual stream at every sub-layer boundary.
@@ -140,7 +155,11 @@ class Walker:
     def __init__(self):
         print(f"[residual-walker] loading {MODEL_ID} on {DEVICE} ({DTYPE}) ...")
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-        self.model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=DTYPE)
+        # eager attention is required for output_attentions: recent transformers
+        # under sdpa returns an EMPTY attentions tuple instead of falling back
+        self.model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID, dtype=DTYPE, attn_implementation="eager"
+        )
         inner = getattr(self.model, "model", None)
         if inner is None or not hasattr(inner, "layers") or not hasattr(inner, "embed_tokens"):
             raise SystemExit(
@@ -150,10 +169,33 @@ class Walker:
             )
         self.model.to(DEVICE).eval()
         self.recorder = ResidualRecorder(self.model)
-        self.n_layers = self.model.config.num_hidden_layers
-        self.hidden = self.model.config.hidden_size
+        config = self.model.config
+        self.n_layers = config.num_hidden_layers
+        self.hidden = config.hidden_size
+        self.n_heads = config.num_attention_heads
+        self.n_kv_heads = getattr(config, "num_key_value_heads", None) or self.n_heads
+        # config.head_dim wins: on Qwen3 it is 128 while hidden/n_heads is 80
+        self.head_dim = getattr(config, "head_dim", None) or self.hidden // self.n_heads
+        self.last_attn_rows = None   # newest position's per-layer [n_heads, seq] weights
+        self.qkv_snapshot = None     # latest walk forward's q/k/v, see _snapshot_qkv
+        self.attn_ok = self._check_attentions()
         self.jlens = self._load_jlens()
         print(f"[residual-walker] ready: {self.n_layers} layers, hidden={self.hidden}")
+
+    def _check_attentions(self):
+        """Probe that attention weights actually come back (transformers is
+        unpinned — under sdpa, output_attentions yields an empty tuple)."""
+        try:
+            probe = torch.tensor([[0, 1]], device=DEVICE)
+            with torch.inference_mode():
+                out = self.model(probe, use_cache=False, output_attentions=True)
+            ok = bool(out.attentions) and len(out.attentions) == self.n_layers
+        except Exception as err:
+            print(f"[residual-walker] attention probe failed: {err}")
+            ok = False
+        if not ok:
+            print("[residual-walker] no attention weights — k/v stream arcs disabled")
+        return ok
 
     def _load_jlens(self):
         """Load the Jacobian lens for MODEL_ID: {layer: J_l tensor} or None.
@@ -191,9 +233,30 @@ class Walker:
                   "continuing with logit lens only")
             return None
 
+    def _snapshot_qkv(self, seq):
+        """Freeze the just-finished forward's q/k/v as per-layer
+        [seq, heads, head_dim] views.
+
+        Published to self.qkv_snapshot in ONE attribute assignment so the
+        /api/qkv thread can never observe a half-built snapshot; the previous
+        snapshot's tensors stay alive for any reader still holding it.
+        """
+        heads = {"q": self.n_heads, "k": self.n_kv_heads, "v": self.n_kv_heads}
+        snap = {"seq": seq}
+        for key, n in heads.items():
+            staged = self.recorder.qkv_staging[key]
+            if len(staged) != self.n_layers:
+                return self.qkv_snapshot   # incomplete capture: keep the last good one
+            snap[key] = [staged[i][0].reshape(seq, n, self.head_dim)
+                         for i in range(self.n_layers)]
+        return snap
+
     @torch.inference_mode()
-    def forward_states(self, input_ids, patch=None):
+    def forward_states(self, input_ids, patch=None, capture_qkv=True):
         """Full forward pass; returns residual stream states [n_points, seq, hidden].
+
+        capture_qkv=False keeps this forward from publishing its q/k/v snapshot
+        — steering-phrase forwards must not clobber what /api/qkv serves.
 
         patch steers the stream right after each block in patch["layers"] —
         a single layer normally, a layer→end range in sticky mode (re-applying
@@ -245,10 +308,16 @@ class Walker:
                 for i in patch["layers"]
             ]
         try:
-            self.model(input_ids, use_cache=False)
+            out = self.model(input_ids, use_cache=False, output_attentions=True)
         finally:
             for handle in handles:
                 handle.remove()
+        # keep only the newest position's attention row per layer — the full
+        # [heads, seq, seq] tuple is ~100 MB at long contexts, the rows ~1 MB
+        attns = out.attentions if (self.attn_ok and out.attentions) else None
+        self.last_attn_rows = [a[0, :, -1, :].float() for a in attns] if attns else None
+        if capture_qkv:
+            self.qkv_snapshot = self._snapshot_qkv(input_ids.shape[1])
         return self.recorder.stream_states()
 
     @torch.inference_mode()
@@ -260,7 +329,7 @@ class Walker:
         source for steering directions when a concept is more than one token.
         """
         ids = self.tokenizer(" " + text.strip(), return_tensors="pt").input_ids.to(DEVICE)
-        states = self.forward_states(ids)
+        states = self.forward_states(ids, capture_qkv=False)
         bos = self.tokenizer.bos_token_id
         start = 1 if (bos is not None and ids.shape[1] > 1 and ids[0, 0].item() == bos) else 0
         return {i: states[2 * i + 2, start:, :].float().mean(dim=0) for i in range(self.n_layers)}
@@ -449,9 +518,15 @@ async def styles():
                         headers={"Cache-Control": "no-cache"})
 
 
-@app.get("/walker.js")
-async def walker_js():
-    return FileResponse(STATIC_DIR / "walker.js", media_type="text/javascript",
+@app.get("/{module}.js")
+async def js_module(module: str):
+    """Serve the frontend's ES modules (walker.js and friends), no-cache."""
+    if not module.replace("-", "").replace("_", "").isalnum():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    path = STATIC_DIR / f"{module}.js"
+    if not path.is_file():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(path, media_type="text/javascript",
                         headers={"Cache-Control": "no-cache"})
 
 
@@ -463,9 +538,41 @@ async def info():
         "device": torch.cuda.get_device_name(0) if DEVICE == "cuda" else "CPU",
         "n_layers": walker.n_layers,
         "hidden": walker.hidden,
+        "heads": {"n_heads": walker.n_heads, "n_kv_heads": walker.n_kv_heads,
+                  "head_dim": walker.head_dim},
+        "arcs": walker.attn_ok,
         "jlens": {"available": walker.jlens is not None,
                   "source": walker.jlens["source"] if walker.jlens else None},
     }
+
+
+@app.get("/api/qkv")
+async def qkv(pos: int, layer: int):
+    """One attention stop's per-head q/k/v from the latest walk forward.
+
+    These are the raw projection outputs — pre-RoPE (and pre-QK-norm on Qwen3):
+    the content each head extracts, not the rotated vectors the attention dot
+    product sees. Valid for every position of the walk because each step
+    re-forwards the whole sequence and causal prefixes are identical.
+    """
+    snap = walker.qkv_snapshot
+    if snap is None:
+        return JSONResponse({"error": "no walk captured yet"}, status_code=409)
+    if not 0 <= layer < walker.n_layers:
+        return JSONResponse({"error": f"layer must be 0..{walker.n_layers - 1}"},
+                            status_code=400)
+    if not 0 <= pos < snap["seq"]:
+        return JSONResponse({"error": f"pos must be 0..{snap['seq'] - 1}"},
+                            status_code=400)
+
+    def extract():
+        return {key: np.round(snap[key][layer][pos].float().cpu().numpy(), 3).tolist()
+                for key in ("q", "k", "v")}
+
+    data = await asyncio.to_thread(extract)
+    data.update(n_heads=walker.n_heads, n_kv_heads=walker.n_kv_heads,
+                head_dim=walker.head_dim, seq=snap["seq"], pos=pos, layer=layer)
+    return data
 
 
 @app.post("/export")
@@ -512,6 +619,25 @@ def _top_rows(tokenizer, logits):
     ]
 
 
+def build_prompt_paths(states, pca, scale):
+    """Ghost-path coordinates for prompt positions 1..seq-2 — the anchors that
+    k/v arcs point back to.
+
+    Position 0 is skipped (the attention sink: excluded from prompt_tokens and
+    the PCA fit alike) and so is the last prompt position, whose geometry IS
+    path 0. Returns [n_prompt_ghosts][n_points][dims], aligned with
+    prompt_tokens.
+    """
+    seq = states.shape[1]
+    if seq <= 2:
+        return []
+    ctx = states[:, 1:seq - 1, :].float().cpu().numpy()   # [n_points, seq-2, hidden]
+    n_points = ctx.shape[0]
+    flat = ctx.transpose(1, 0, 2).reshape((seq - 2) * n_points, -1)
+    proj = (pca.transform(flat) * scale).reshape(seq - 2, n_points, -1)
+    return [[[round(float(c), 3) for c in row] for row in tok] for tok in proj]
+
+
 def build_packet(walker, path_states, pca, scale, temperature, token_index):
     """Assemble one token's path packet: 3D points, both lenses, sampled token."""
     coords = pca.transform(path_states.float().cpu().numpy()) * scale
@@ -531,6 +657,19 @@ def build_packet(walker, path_states, pca, scale, temperature, token_index):
             _top_rows(walker.tokenizer, row) if row is not None else None
             for row in walker.jlens_logits(path_states)
         ]
+    attn = None
+    if walker.last_attn_rows is not None:
+        attn = [None] * (1 + 2 * walker.n_layers)
+        for layer, rows in enumerate(walker.last_attn_rows):
+            # strongest single head per source; the slice drops position 0 (the
+            # attention sink — deliberately has no scene geometry) and the
+            # final position (self-attention — a zero-length arc)
+            inner = rows.max(dim=0).values[1:-1]
+            top = torch.topk(inner, min(ATTN_TOP_K, inner.shape[0]))
+            attn[2 * layer + 1] = [
+                [int(j) + 1, round(float(w), 3)]
+                for j, w in zip(top.indices, top.values) if float(w) >= ATTN_MIN_W
+            ]
     next_id = walker.sample(logits[-1], temperature)
     return {
         "type": "path",
@@ -538,6 +677,7 @@ def build_packet(walker, path_states, pca, scale, temperature, token_index):
         "coords": [[round(float(c), 3) for c in row] for row in coords],
         "lens": lens,
         "jlens": jlens,
+        "attn": attn,
         "chosen": token_text(walker.tokenizer, next_id),
         "chosen_prob": round(float(probs[-1, next_id]), 4),
     }, next_id
@@ -607,6 +747,8 @@ async def walk(ws: WebSocket):
             pca, scale = await asyncio.to_thread(walker.fit_projection, states)
             if patch is not None:
                 states = await asyncio.to_thread(walker.forward_states, ids, patch)
+            # ghost anchors reflect the states in play (patched when patching)
+            prompt_paths = await asyncio.to_thread(build_prompt_paths, states, pca, scale)
 
             await ws.send_json({
                 "type": "meta",
@@ -625,6 +767,8 @@ async def walk(ws: WebSocket):
                 "prompt_tokens": [
                     token_text(walker.tokenizer, int(t)) for t in ids[0][1:]
                 ],
+                "prompt_len": int(ids.shape[1]),
+                "prompt_paths": prompt_paths,
             })
 
             generated = []

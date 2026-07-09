@@ -15,6 +15,7 @@
     --ghost: #898781;
     --bar: #199e70;
     --patch: #9085e9;
+    --arc: #c168e0;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; }
@@ -162,7 +163,13 @@
     word-break: break-word;
   }
   #story .prompt { color: var(--ink-2); }
-  #story .gen { color: var(--ink); font-weight: 600; }
+  #story .gen { color: var(--ink); font-weight: 600; cursor: pointer; }
+  #story .gen:hover { color: var(--attn); }
+  #story .gen.selected {
+    color: var(--attn);
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+  }
   #story .gen.flash { animation: flash 0.9s ease-out; border-radius: 3px; }
   @keyframes flash {
     0% { background: var(--bar); color: #fff; }
@@ -214,6 +221,31 @@
     background: var(--page); color: var(--ink); border: 1px solid var(--border);
     border-radius: 6px; padding: 6px 8px; font-size: 12px;
   }
+
+  /* ---------- point inspector (q/k/v) ---------- */
+  #inspector { display: flex; flex-direction: column; gap: 8px; }
+  #inspHint, #inspStatus, .inspNote { font-size: 11px; color: var(--muted); }
+  #inspBody { display: flex; flex-direction: column; gap: 8px; }
+  #inspWhere { font-size: 13px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  #inspGqa { font-size: 11px; color: var(--muted); }
+  .inspLabel { font-size: 10.5px; color: var(--muted); letter-spacing: 0.04em; margin-bottom: -4px; }
+  #inspector canvas {
+    width: 100%; height: auto;
+    image-rendering: pixelated;
+    border: 1px solid var(--border); border-radius: 4px;
+    display: block;
+    background: var(--page);
+    min-height: 14px;
+  }
+  #attnList { display: flex; flex-direction: column; gap: 6px; }
+  #attnList .fill { background: var(--arc); transition: none; }
+  #headNorms {
+    display: flex; align-items: flex-end; gap: 2px;
+    height: 30px; padding: 2px;
+    background: var(--page);
+    border: 1px solid var(--border); border-radius: 4px;
+  }
+  .headNormBar { flex: 1; background: var(--arc); border-radius: 1px; min-height: 1px; }
 
   #promptDetails summary {
     font-size: 11px; color: var(--muted); cursor: pointer;

@@ -15,6 +15,7 @@
     <span class="item"><span class="dot" style="background:var(--attn)"></span>+ attention step</span>
     <span class="item"><span class="dot" style="background:var(--mlp)"></span>+ MLP step</span>
     <span class="item"><span class="dot" style="background:var(--ghost); opacity:.5"></span>earlier tokens (ghosts)</span>
+    <span class="item"><span class="dot" style="background:var(--arc)"></span>k/v stream (attention arcs)</span>
     <span class="item"><span class="dot" style="background:var(--patch)"></span>💉 patch point (nudge/swap)</span>
   </div>
   <div id="guess"></div>
@@ -55,6 +56,9 @@
     </label>
     <label class="check" style="grid-column: 1 / -1">
       <input id="tour" type="checkbox"> 🖐 grand tour — slowly turn the hand
+    </label>
+    <label class="check" id="kvArcsLabel" style="grid-column: 1 / -1">
+      <input id="kvArcs" type="checkbox" checked> 🟣 k/v stream — attention arcs
     </label>
   </div>
 
@@ -124,6 +128,33 @@
     what it's disposed to make the model say <i>later</i>, the paper's window into
     silent thoughts. Method: Anthropic, “Verbalizable Representations Form a Global
     Workspace in Language Models”; lens files fitted &amp; hosted by Neuronpedia.
+  </div>
+
+  <div class="sectionTitle">Point inspector — q/k/v</div>
+  <div id="inspector">
+    <div id="inspHint">click a point on the path (or scrub with ←/→) to inspect it</div>
+    <div id="inspBody" style="display:none">
+      <div id="inspWhere"></div>
+      <div id="inspGqa"></div>
+      <div class="inspLabel">where this query looked (weight = max over heads)</div>
+      <div id="attnList"></div>
+      <div id="inspStatus" style="display:none"></div>
+      <div class="inspLabel">q — one row per head</div>
+      <canvas id="qCanvas"></canvas>
+      <div class="inspLabel">k — one row per kv head</div>
+      <canvas id="kCanvas"></canvas>
+      <div class="inspLabel">v — one row per kv head</div>
+      <canvas id="vCanvas"></canvas>
+      <div class="inspLabel">‖q‖ per head</div>
+      <div id="headNorms"></div>
+      <div class="foot">
+        Raw q/k/v projection outputs — a <b>content view</b> (pre-RoPE, and
+        pre-QK-norm on Qwen3), not the rotated vectors the attention dot product
+        sees. The k and v rows are what this token publishes to the k/v stream at
+        this layer; q is the question it asks. Arc weights are max over heads;
+        position 0 (the attention sink) is omitted, so weights don't sum to 1.
+      </div>
+    </div>
   </div>
 </aside>
 

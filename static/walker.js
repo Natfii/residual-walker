@@ -7,6 +7,9 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { Line2 } from 'three/addons/lines/Line2.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
+import { initKvStream } from './kvstream.js';
+import { initInspector } from './inspector.js';
+import { drawRecordingOverlay } from './overlay.js';
 
 const COLORS = { attn: 0x3987e5, mlp: 0xd95926, embed: 0xffffff, ghost: 0x898781 };
 
@@ -40,6 +43,8 @@ scene.add(grid);
 const lineMats = {
   path:  new LineMaterial({ vertexColors: true, linewidth: 3 }),
   ghost: new LineMaterial({ color: COLORS.ghost, linewidth: 1.6, transparent: true, opacity: 0.28 }),
+  arc:   new LineMaterial({ vertexColors: true, linewidth: 1.6, transparent: true, opacity: 0.9, depthWrite: false }),
+  promptGhost: new LineMaterial({ color: COLORS.ghost, linewidth: 1.2, transparent: true, opacity: 0.15 }),
 };
 const sphereGeo = new THREE.SphereGeometry(0.62, 20, 14);
 const embedGeo = new THREE.SphereGeometry(0.95, 22, 16);
@@ -82,6 +87,10 @@ $('patchAlpha').oninput = e => { $('patchAlphaNum').value = e.target.value; };
 $('patchAlphaNum').oninput = e => { $('patchAlpha').value = e.target.value; };
 $('orbit').onchange = e => controls.autoRotate = e.target.checked;
 controls.autoRotate = $('orbit').checked;
+$('kvArcs').onchange = e => {
+  kv.setGhostVisibility(e.target.checked);
+  kv.rebuildArcSet();
+};
 
 /* ---------- lens mode (logit vs Jacobian) ---------- */
 let lensMode = 'logit';
@@ -93,7 +102,7 @@ function setLensMode(m) {
   $('lensTitle').textContent = m === 'jlens'
     ? 'J-lens — “what it’s disposed to say”'
     : 'Logit lens — “if we fired right now”';
-  if (current && lensState) updateLens(lensState.k);   // re-render the live step
+  if (viewPath() && lensState) updateLens(lensState.k);   // re-render the live step
 }
 $('lensModeLogit').onclick = () => setLensMode('logit');
 $('lensModeJ').onclick = () => setLensMode('jlens');
@@ -116,6 +125,11 @@ $('patchSticky').onchange = () => {
 fetch('/api/info').then(r => r.json()).then(info => {
   $('modelChip').textContent =
     `${info.model} · ${info.n_layers} layers · ${info.hidden}-dim stream · ${info.device}`;
+  headsInfo = info.heads || null;
+  if (info.arcs === false) {          // exotic arch: no attention weights
+    $('kvArcs').checked = false;
+    $('kvArcsLabel').style.display = 'none';
+  }
   jlensAvailable = !!(info.jlens && info.jlens.available);
   if (jlensAvailable) {
     $('lensSwitch').style.display = 'flex';
@@ -206,6 +220,35 @@ function makeLabelSprite(text) {
   return sprite;
 }
 
+/* ---------- k/v stream (prompt ghosts + attention arcs) ----------
+ * Owned by kvstream.js; it reads the walk state lazily through view() every
+ * time arcs are rebuilt, so it always describes the currently viewed path. */
+const kv = initKvStream({
+  scene,
+  arcMaterial: lineMats.arc,
+  ghostMaterial: lineMats.promptGhost,
+  projectPoint,
+  makeLabelSprite,
+  displayToken,
+  view: () => ({
+    path: viewPath(),
+    step: viewStep,
+    enabled: $('kvArcs').checked,
+    paths,
+    promptLen,
+    promptTokens: metaPromptTokens,
+  }),
+});
+
+/* ---------- point inspector (q/k/v panel) ----------
+ * Owned by inspector.js; fetches /api/qkv on demand and renders the per-head
+ * heatmaps + "where this query looked" list for the selected attention stop. */
+const inspector = initInspector({
+  displayToken,
+  tokenAtPos: j => kv.tokenAtPos(j),
+  view: () => ({ steps, promptLen, headsInfo, deferFetch: walking && !paused }),
+});
+
 /* ---------- one token's path ----------
  * The whole path is ONE Line2: reveal advances geometry.instanceCount, the
  * grand tour rewrites the existing position buffer in place, and step-kind
@@ -218,6 +261,8 @@ class TokenPath {
     this.positions = this.coords.map(() => new THREE.Vector3());
     this.lens = packet.lens;
     this.jlens = packet.jlens || null;   // per-point rows, null where no transport
+    this.attn = packet.attn || null;     // per-point arc sources [[pos, w], ...]
+    this.index = packet.index;
     this.chosen = packet.chosen;
     this.chosenProb = packet.chosen_prob;
     this.steps = steps;
@@ -355,6 +400,33 @@ let promptText = '';               // mirrored for the recording overlay
 let genText = '';
 let lensState = null;              // {k, info, rows} at the current step
 let patchInfo = null;              // activation-patch echo from meta
+let lastPath = null;               // most recently finished path (post-done selection)
+let selectedPath = null;           // story-token click selection (overrides the live view)
+let promptLen = 0;                 // absolute prompt length, position 0 included
+let metaPromptTokens = [];         // prompt_tokens from meta (positions 1..P-1)
+let headsInfo = null;              // {n_heads, n_kv_heads, head_dim} from /api/info
+
+/** The path the lens/inspector/arcs describe: a story-clicked token first,
+ *  else the walking one, else the last finished one — so clicking points
+ *  keeps working after the walk ends. */
+function viewPath() { return selectedPath ?? current ?? lastPath; }
+
+/** Story-box token click: park the whole view on the walk that fired this
+ *  token — lens, inspector, and arcs all follow, and ←/→ steps through its
+ *  layers from there. The cursor lands on the walk's FINAL ATTENTION stop
+ *  (one below the head fire): the lens already reads the fired token there
+ *  and the q/k/v inspector has a real attention point to fill with. */
+function selectStoryToken(path) {
+  selectedPath = path;
+  viewStep = Math.max(0, path.positions.length - 2);
+  if (walking && !paused) setPaused(true);
+  refreshStoryHighlight();
+  updateLens(viewStep);
+}
+
+function refreshStoryHighlight() {
+  for (const p of paths) p.storySpan?.classList.toggle('selected', p === selectedPath);
+}
 
 function setStatus(t) { statusEl.textContent = t; }
 
@@ -388,121 +460,13 @@ function startRecording() {
 function compositeFrame() {
   if (!recCtx || !recorder || recorder.state !== 'recording') return;
   recCtx.drawImage(renderer.domElement, 0, 0, recCanvas.width, recCanvas.height);
-  drawRecordingOverlay(recCtx, recCanvas.width, recCanvas.height);
-}
-
-function trimLeft(ctx, text, maxW) {
-  if (ctx.measureText(text).width <= maxW) return text;
-  // jump-cut near the target length first — the char-by-char loop alone costs
-  // hundreds of measureText calls per frame once generations get long
-  let t = text;
-  const avg = ctx.measureText(t).width / t.length;
-  const keep = Math.min(t.length, Math.ceil((maxW / avg) * 1.4) + 2);
-  t = t.slice(t.length - keep);
-  while (t.length > 1 && ctx.measureText('…' + t).width > maxW) t = t.slice(1);
-  return '…' + t;
-}
-
-function drawRecordingOverlay(ctx, w, h) {
-  const s = h / 950;
-  const pad = 14 * s, margin = 16 * s;
-  const cardW = Math.min(480 * s, w - 2 * margin);
-  const rowH = 24 * s;
-  const lensRows = lensState ? lensState.rows.length : 0;
-  const honestyH = tourInfo ? 18 * s : 0;
-  const patchH = patchInfo?.active ? 18 * s : 0;
-  const cardH = pad * 2 + 20 * s + (lensState ? 26 * s + lensRows * rowH : 0) + honestyH + patchH;
-  const x = margin, y = h - margin - cardH;
-  const KIND_COLORS = { embed: '#ffffff', attn: '#3987e5', mlp: '#d95926' };
-
-  ctx.save();
-  ctx.globalAlpha = 0.9;
-  ctx.fillStyle = '#1a1a19';
-  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.roundRect(x, y, cardW, cardH, 10 * s);
-  ctx.fill();
-  ctx.stroke();
-  ctx.globalAlpha = 1;
-
-  const textX = x + pad, maxW = cardW - pad * 2;
-  let ty = y + pad + 12 * s;
-
-  /* story line: prompt in secondary ink, generated tokens bold white; the
-     generation claims its width first, the prompt left-trims into what's left,
-     so the newest words always stay on film */
-  ctx.font = `600 ${13.5 * s}px system-ui, sans-serif`;
-  const gen = trimLeft(ctx, genText, maxW);
-  const genW = ctx.measureText(gen).width;
-  ctx.font = `${13.5 * s}px system-ui, sans-serif`;
-  const prRoom = maxW - genW - 4 * s;
-  const pr = prRoom > 12 * s ? trimLeft(ctx, promptText, prRoom) : '';
-  ctx.fillStyle = '#c3c2b7';
-  ctx.fillText(pr, textX, ty);
-  const prW = ctx.measureText(pr).width;
-  ctx.fillStyle = '#ffffff';
-  ctx.font = `600 ${13.5 * s}px system-ui, sans-serif`;
-  ctx.fillText(gen, textX + prW, ty);
-
-  if (lensState) {
-    ty += 24 * s;
-    const info = lensState.info;
-    ctx.fillStyle = KIND_COLORS[info.kind];
-    ctx.beginPath();
-    ctx.arc(textX + 5 * s, ty - 4 * s, 5 * s, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#c3c2b7';
-    ctx.font = `${12 * s}px system-ui, sans-serif`;
-    const where = info.kind === 'embed' ? 'embedding — the path begins'
-      : `${info.kind === 'attn' ? 'attention' : 'MLP'} add · layer ${info.layer}`;
-    ctx.fillText(`step ${lensState.k}/${steps.length - 1} · ${where}` +
-      (lensState.usingJ ? ' · J-lens' : ''), textX + 16 * s, ty);
-
-    const chipW = 96 * s, pctW = 46 * s;
-    const trackX = textX + chipW + 8 * s;
-    const trackW = maxW - chipW - pctW - 16 * s;
-    lensState.rows.forEach((r, i) => {
-      const ry = ty + 10 * s + i * rowH;
-      ctx.font = `${i === 0 ? '700 ' : ''}${11.5 * s}px ui-monospace, Consolas, monospace`;
-      ctx.fillStyle = i === 0 ? '#ffffff' : '#c3c2b7';
-      ctx.fillText(trimLeft(ctx, displayToken(r.t), chipW), textX, ry + 12 * s);
-      ctx.fillStyle = '#0d0d0d';
-      ctx.beginPath();
-      ctx.roundRect(trackX, ry + 3 * s, trackW, 10 * s, 3 * s);
-      ctx.fill();
-      ctx.fillStyle = '#199e70';
-      ctx.beginPath();
-      ctx.roundRect(trackX, ry + 3 * s, Math.max(trackW * r.p, 2), 10 * s, 3 * s);
-      ctx.fill();
-      ctx.fillStyle = i === 0 ? '#c3c2b7' : '#898781';
-      ctx.font = `${11 * s}px system-ui, sans-serif`;
-      const pct = `${(r.p * 100).toFixed(1)}%`;
-      ctx.fillText(pct, textX + maxW - ctx.measureText(pct).width, ry + 12 * s);
-    });
-    ty += 10 * s + lensRows * rowH;
-  }
-
-  if (patchInfo?.active) {
-    ctx.fillStyle = '#9085e9';
-    ctx.font = `${11 * s}px system-ui, sans-serif`;
-    const parts = [];
-    const shortLabel = t => t.length > 26 ? t.slice(0, 25) + '…' : t;
-    if (patchInfo.add) parts.push(`+${shortLabel(patchInfo.add.trim())}`);
-    if (patchInfo.remove) parts.push(`−${shortLabel(patchInfo.remove.trim())}`);
-    if (patchInfo.source === 'phrase') parts.push('(phrase vibes)');
-    const verb = patchInfo.mode === 'swap' ? '🔁 J-swap' : '💉 nudge';
-    const range = patchInfo.sticky ? `${patchInfo.layer}→${patchInfo.layer_end}` : `${patchInfo.layer}`;
-    ctx.fillText(`${verb} ${parts.join(' ')} @ layer ${range} ×${patchInfo.alpha}`, textX, ty + 14 * s);
-    ty += 18 * s;
-  }
-  if (tourInfo) {
-    ctx.fillStyle = '#898781';
-    ctx.font = `${11 * s}px system-ui, sans-serif`;
-    const mode = tourLambda > 0.02 ? ' · touring the hidden dimensions' : ' · best angle';
-    ctx.fillText(`shadow honesty ${(shadowHonesty() * 100).toFixed(1)}%${mode}`, textX, ty + 14 * s);
-  }
-  ctx.restore();
+  drawRecordingOverlay(recCtx, recCanvas.width, recCanvas.height, {
+    promptText, genText, lensState, patchInfo,
+    stepsTotal: steps.length - 1,
+    honesty: tourInfo ? shadowHonesty() : null,
+    touring: tourLambda > 0.02,
+    displayToken,
+  });
 }
 
 async function finishRecording() {
@@ -538,6 +502,10 @@ async function finishRecording() {
 function resetWalk() {
   for (const p of paths) p.dispose();
   paths = []; queue = []; current = null; doneInfo = null;
+  kv.reset();
+  inspector.reset();
+  lastPath = null;
+  selectedPath = null;
   for (const r of rings) scene.remove(r.mesh);
   rings.length = 0;
   headMarker.visible = false;
@@ -607,6 +575,9 @@ function startWalk() {
       }
       $('promptSummary').textContent = `prompt tokens (${msg.prompt_tokens.length})`;
       $('promptDetails').style.display = 'block';
+      promptLen = msg.prompt_len ?? 0;
+      metaPromptTokens = msg.prompt_tokens;
+      kv.setPromptGhosts(msg.prompt_paths, msg.prompt_tokens, $('kvArcs').checked);
     } else if (msg.type === 'path') {
       queue.push(msg);
     } else if (msg.type === 'done') {
@@ -638,8 +609,8 @@ function stopWalk(flush = true) {
   $('walkBtn').disabled = false;
   $('stopBtn').disabled = true;
   $('pauseBtn').disabled = true;
-  $('stepBackBtn').disabled = true;
-  $('stepFwdBtn').disabled = true;
+  $('stepBackBtn').disabled = !paths.length;
+  $('stepFwdBtn').disabled = !paths.length;
 }
 
 $('walkBtn').onclick = startWalk;
@@ -654,13 +625,22 @@ function setPaused(p) {
   $('pauseBtn').textContent = p ? '▶' : '⏸';
   $('stepBackBtn').disabled = !p;
   $('stepFwdBtn').disabled = !p;
-  if (!p) lastStepAt = performance.now();   // resume without a catch-up burst
+  if (!p) {
+    lastStepAt = performance.now();   // resume without a catch-up burst
+    selectedPath = null;              // resuming returns the view to the live head
+    refreshStoryHighlight();
+  }
+  // re-render the selected step: the inspector defers its q/k/v fetch while
+  // the animation runs, so pausing must give it another look at the cursor
+  if (p && lensState && viewPath()) updateLens(lensState.k);
 }
 
 /** One TokenPath begins: ghost the others, reset the scrub cursor. */
 function startNextPath() {
   if (!queue.length) return false;
   for (const p of paths) p.ghost();
+  selectedPath = null;             // a new walk takes the view back live
+  refreshStoryHighlight();
   current = new TokenPath(queue.shift(), steps);
   setStatus(`walking token ${paths.length + 1}…`);
   lastStepAt = 0;
@@ -669,8 +649,14 @@ function startNextPath() {
 }
 
 function stepForward() {
+  if (selectedPath) {              // stepping a story-selected token: cursor only
+    if (viewStep < selectedPath.revealed - 1) { viewStep++; updateLens(viewStep); }
+    return;
+  }
   if (!current) {
-    if (startNextPath() && current.revealNext()) { viewStep = 0; updateLens(0); }
+    if (startNextPath() && current.revealNext()) { viewStep = 0; updateLens(0); return; }
+    const p = viewPath();          // post-done: keep scrubbing the last path
+    if (p && viewStep < p.revealed - 1) { viewStep++; updateLens(viewStep); }
     return;
   }
   if (viewStep < current.revealed - 1) {          // walk the cursor back up first
@@ -687,7 +673,8 @@ function stepForward() {
 }
 
 function stepBack() {
-  if (!current || viewStep <= 0) return;
+  const p = viewPath();
+  if (!p || viewStep <= 0) return;
   viewStep--;
   updateLens(viewStep);
 }
@@ -698,8 +685,34 @@ $('stepBackBtn').onclick = stepBack;
 window.addEventListener('keydown', e => {
   if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
   if (e.code === 'Space' && !$('pauseBtn').disabled) { e.preventDefault(); setPaused(!paused); }
-  else if (paused && e.key === 'ArrowRight') { e.preventDefault(); stepForward(); }
-  else if (paused && e.key === 'ArrowLeft') { e.preventDefault(); stepBack(); }
+  else if ((paused || !walking) && e.key === 'ArrowRight') { e.preventDefault(); stepForward(); }
+  else if ((paused || !walking) && e.key === 'ArrowLeft') { e.preventDefault(); stepBack(); }
+});
+
+/* ---------- click-to-inspect ----------
+ * A click (not a drag) on any revealed sphere of the viewed path scrubs the
+ * cursor to that point — lens, inspector, and arc highlight all follow. */
+const raycaster = new THREE.Raycaster();
+const pointerNDC = new THREE.Vector2();
+let pointerDownX = 0, pointerDownY = 0;
+renderer.domElement.addEventListener('pointerdown', e => {
+  pointerDownX = e.clientX; pointerDownY = e.clientY;
+});
+renderer.domElement.addEventListener('pointerup', e => {
+  if (Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY) > 6) return;  // drag
+  const p = current ?? lastPath;   // spheres only exist on the live/final path
+  if (!p || !p.spheres.length) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointerNDC.set(((e.clientX - rect.left) / rect.width) * 2 - 1,
+                 -((e.clientY - rect.top) / rect.height) * 2 + 1);
+  raycaster.setFromCamera(pointerNDC, camera);
+  const hit = raycaster.intersectObjects(p.spheres, false)[0];
+  if (!hit) return;
+  if (walking && !paused) setPaused(true);
+  selectedPath = null;             // a scene click hands the view back to this path
+  refreshStoryHighlight();
+  viewStep = hit.object.userData.idx;
+  updateLens(viewStep);
 });
 
 /* ---------- per-step UI ---------- */
@@ -714,10 +727,12 @@ function updateLens(k) {
     where += ' · 💉';
   }
 
-  let rows = current.lens[k];
+  const p = viewPath();
+  if (!p) return;
+  let rows = p.lens[k];
   let usingJ = false;
-  if (lensMode === 'jlens' && current.jlens && current.jlens[k]) {
-    rows = current.jlens[k];
+  if (lensMode === 'jlens' && p.jlens && p.jlens[k]) {
+    rows = p.jlens[k];
     usingJ = true;
   }
   if (lensMode === 'jlens' && !usingJ) where += ' · no J transport — logit shown';
@@ -757,6 +772,9 @@ function updateLens(k) {
   const prob = document.createElement('span');
   prob.className = 'prob'; prob.textContent = `${(rows[0].p * 100).toFixed(0)}%`;
   guessEl.appendChild(prob);
+
+  kv.rebuildArcSet();
+  inspector.update(k, p);
 }
 
 function finishCurrent(withEffects = true) {
@@ -775,11 +793,17 @@ function finishCurrent(withEffects = true) {
   const span = document.createElement('span');
   span.className = 'gen flash';
   span.textContent = current.chosen;
+  span.title = "click — step through this token's walk";
+  const finished = current;
+  finished.storySpan = span;
+  span.onclick = () => selectStoryToken(finished);
   storyEl.appendChild(span);
   storyEl.scrollTop = storyEl.scrollHeight;   // keep the newest words in view
   genText += current.chosen;
   paths.push(current);
+  lastPath = current;
   current = null;
+  kv.rebuildArcSet();   // arcs stay on the finished path until the next one starts
   firePauseUntil = performance.now() + (withEffects ? 700 : 0);
 }
 
@@ -830,6 +854,7 @@ function updateTour(now) {
     basis = computeBasis(tourT, tourInfo.dims);
     if (current) current.refreshPositions();
     for (const p of paths) p.refreshPositions();
+    kv.refreshGhosts();   // arcs re-read the fresh positions in kv.animate below
   }
   prevLambda = tourLambda;
 
@@ -848,6 +873,7 @@ function animate(now) {
   requestAnimationFrame(animate);
   const t = clock.getElapsedTime();
   updateTour(now);
+  kv.animate(t);   // traveling pulse + arcs tracking freshly toured positions
 
   if (walking || current || queue.length) {
     if (!paused && !current && queue.length && now >= firePauseUntil) startNextPath();
@@ -864,19 +890,19 @@ function animate(now) {
     }
     if (!current && !queue.length && doneInfo && walking) {
       walking = false;
-      setStatus(`done — ${paths.length} tokens (full text in the story box)`);
+      setStatus(`done — ${paths.length} tokens (click a story token to step through it)`);
       setTimeout(finishRecording, 900);   // let the last fire-ring land on film
       $('walkBtn').disabled = false;
       $('stopBtn').disabled = true;
       $('pauseBtn').disabled = true;
-      $('stepBackBtn').disabled = true;
-      $('stepFwdBtn').disabled = true;
+      $('stepBackBtn').disabled = false;  // ←/→ keep scrubbing the finished walk
+      $('stepFwdBtn').disabled = false;
       if (ws) { ws.close(); ws = null; }
     }
   }
 
-  /* head marker + floating guess label follow the newest point */
-  const active = current;
+  /* head marker + floating guess label follow the viewed path's cursor */
+  const active = viewPath();
   if (active && active.revealed > 0) {
     headMarker.visible = true;
     const cursor = Math.max(0, Math.min(viewStep, active.revealed - 1));
