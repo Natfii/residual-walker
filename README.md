@@ -16,6 +16,9 @@ pick if the path stopped there.
 
 ## Quick start
 
+<img width="2497" height="1267" alt="UI" src="https://github.com/user-attachments/assets/3974cffc-480e-49d5-bf70-e90306b85dc3" />
+
+
 **Windows, no Python needed** — grab `ResidualWalker.exe` (from the repo's
 Releases page), drop it in this folder,
 double-click. First run bootstraps everything: a private Python environment,
