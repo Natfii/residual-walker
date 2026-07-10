@@ -9,6 +9,9 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
 import { initKvStream } from './kvstream.js';
 import { initInspector } from './inspector.js';
+import { initLabels } from './labels.js';
+import { initLegend } from './legend.js';
+import { initModelDrawer } from './modeldrawer.js';
 import { drawRecordingOverlay } from './overlay.js';
 
 const COLORS = { attn: 0x3987e5, mlp: 0xd95926, embed: 0xffffff, ghost: 0x898781 };
@@ -121,23 +124,46 @@ $('patchSticky').onchange = () => {
   defaultPatchAlpha();
 };
 
-/* configure the UI from the server before any walk */
-fetch('/api/info').then(r => r.json()).then(info => {
+/* ---------- server info → UI config ---------- */
+
+/** Configure the UI from an /api/info payload — at boot and again after a
+ *  model switch, so every field must be set in both directions. */
+function applyServerInfo(info) {
   $('modelChip').textContent =
     `${info.model} · ${info.n_layers} layers · ${info.hidden}-dim stream · ${info.device}`;
   headsInfo = info.heads || null;
-  if (info.arcs === false) {          // exotic arch: no attention weights
-    $('kvArcs').checked = false;
-    $('kvArcsLabel').style.display = 'none';
-  }
+  const arcsOk = info.arcs !== false;   // exotic arch: no attention weights
+  if (!arcsOk) $('kvArcs').checked = false;
+  $('kvArcsLabel').style.display = arcsOk ? '' : 'none';
+  $('kvArcs').dispatchEvent(new Event('change'));   // resync arcs + legend mark
   jlensAvailable = !!(info.jlens && info.jlens.available);
-  if (jlensAvailable) {
-    $('lensSwitch').style.display = 'flex';
-    $('patchSwapOpt').disabled = false;
+  $('lensSwitch').style.display = jlensAvailable ? 'flex' : 'none';
+  $('patchSwapOpt').disabled = !jlensAvailable;
+  if (!jlensAvailable) {
+    setLensMode('logit');
+    if ($('patchMode').value === 'swap') { $('patchMode').value = 'nudge'; defaultPatchAlpha(); }
   }
   // sticky default range ends before the motor zone (final quarter of layers)
   $('patchLayerEnd').value = Math.max(0, info.n_layers - 1 - Math.floor(info.n_layers / 4));
-}).catch(() => {});
+}
+fetch('/api/info').then(r => r.json()).then(applyServerInfo).catch(() => {});
+
+/** A model switch invalidates everything a walk produced — the layer count,
+ *  steps, and projection all change together. Full scene + panel reset. */
+function resetForModelSwitch() {
+  resetWalk();
+  steps = [];
+  tourInfo = null; tourT = 0; tourLambda = 0; basis = null;
+  $('shadowMeter').style.display = 'none';
+  setStatus('ready');
+}
+
+initModelDrawer({
+  applyServerInfo,
+  resetForModelSwitch,
+  isWalking: () => walking,
+  stopWalk,
+});
 
 /** Make control characters in a token visible without breaking layout. */
 function displayToken(t) {
@@ -203,22 +229,8 @@ function shadowHonesty() {
   return home * (1 - tourLambda) + tour * tourLambda;
 }
 
-/** Billboard text label used for ghost path endpoints. */
-function makeLabelSprite(text) {
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
-  ctx.font = '600 34px system-ui, sans-serif';
-  const w = Math.ceil(ctx.measureText(text).width) + 24;
-  canvas.width = w; canvas.height = 52;
-  const ctx2 = canvas.getContext('2d');
-  ctx2.font = '600 34px system-ui, sans-serif';
-  ctx2.fillStyle = '#c3c2b7';
-  ctx2.fillText(text, 12, 38);
-  const tex = new THREE.CanvasTexture(canvas);
-  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, opacity: 0.85 }));
-  sprite.scale.set(w * 0.055, 52 * 0.055, 1);
-  return sprite;
-}
+/* billboard token labels + their per-frame zoom clamp — see labels.js */
+const { makeLabelSprite, clampLabelScales } = initLabels({ scene, camera, stage });
 
 /* ---------- k/v stream (prompt ghosts + attention arcs) ----------
  * Owned by kvstream.js; it reads the walk state lazily through view() every
@@ -247,6 +259,14 @@ const inspector = initInspector({
   displayToken,
   tokenAtPos: j => kv.tokenAtPos(j),
   view: () => ({ steps, promptLen, headsInfo, deferFetch: walking && !paused }),
+});
+
+/* ---------- legend visibility toggles ----------
+ * Owned by legend.js; TokenPath re-applies the state whenever it grows new
+ * geometry, so orbs and trails born while a category is struck stay hidden. */
+const legend = initLegend({
+  view: () => ({ paths, current }),
+  kvArcsBox: $('kvArcs'),
 });
 
 /* ---------- one token's path ----------
@@ -323,6 +343,7 @@ class TokenPath {
     if (k === 0) {
       const start = new THREE.Mesh(embedGeo, sphereMats.embed);
       start.userData.idx = 0;
+      start.userData.kind = 'embed';
       start.position.copy(this.positions[0]);
       this.group.add(start);
       this.spheres.push(start);
@@ -334,12 +355,16 @@ class TokenPath {
         ? new THREE.Mesh(patchGeo, patchMat)
         : new THREE.Mesh(sphereGeo, sphereMats[kind]);
       dot.userData.idx = k;
+      dot.userData.kind = isNudge ? 'patch' : kind;
       dot.position.copy(this.positions[k]);
       this.group.add(dot);
       this.spheres.push(dot);
-      if (isNudge && k === patchInfo.step) fireRing(this.positions[k], 0x9085e9, 6);
+      if (isNudge && k === patchInfo.step && legend.visible('patch')) {
+        fireRing(this.positions[k], 0x9085e9, 6);
+      }
     }
     this.revealed++;
+    legend.applyToPath(this);
     return true;
   }
 
@@ -360,6 +385,7 @@ class TokenPath {
     label.position.copy(end.position).add(new THREE.Vector3(0, 2.4, 0));
     this.group.add(label);
     this.labelSprite = label;
+    legend.applyToPath(this);
   }
 
   dispose() {
@@ -706,7 +732,7 @@ renderer.domElement.addEventListener('pointerup', e => {
   pointerNDC.set(((e.clientX - rect.left) / rect.width) * 2 - 1,
                  -((e.clientY - rect.top) / rect.height) * 2 + 1);
   raycaster.setFromCamera(pointerNDC, camera);
-  const hit = raycaster.intersectObjects(p.spheres, false)[0];
+  const hit = raycaster.intersectObjects(p.spheres.filter(s => s.visible), false)[0];
   if (!hit) return;
   if (walking && !paused) setPaused(true);
   selectedPath = null;             // a scene click hands the view back to this path
@@ -874,6 +900,7 @@ function animate(now) {
   const t = clock.getElapsedTime();
   updateTour(now);
   kv.animate(t);   // traveling pulse + arcs tracking freshly toured positions
+  clampLabelScales();
 
   if (walking || current || queue.length) {
     if (!paused && !current && queue.length && now >= firePauseUntil) startNextPath();

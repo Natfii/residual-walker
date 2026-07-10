@@ -21,7 +21,10 @@ Overrides:  RESIDUAL_WALKER_MODEL=<hf-repo-id>, RESIDUAL_WALKER_PORT=<port>,
 """
 
 import asyncio
+import gc
+import json
 import os
+import re
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -36,7 +39,34 @@ from fastapi.staticfiles import StaticFiles
 from sklearn.decomposition import PCA
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_ID = os.environ.get("RESIDUAL_WALKER_MODEL", "unsloth/Llama-3.2-1B")
+APP_DIR = Path(__file__).parent
+MODEL_FILE = APP_DIR / ".model"           # current choice — shared with launcher.py
+CUSTOM_MODELS_FILE = APP_DIR / ".models"  # drawer-added model ids (JSON list)
+
+# Mirrors launcher.py's MODEL_PRESETS — kept as a deliberate copy: the
+# PyInstaller'd launcher isn't importable from a running server.
+MODEL_PRESETS = [
+    ("unsloth/Llama-3.2-1B", "Llama 3.2 1B — recommended first walk: 16 big steps, "
+                             "dramatic firework paths (the demo gif)"),
+    ("Qwen/Qwen3-1.7B", "Qwen3 1.7B — 28 gentler layers, pre-fitted J-lens ✓"),
+    ("Qwen/Qwen3-4B", "Qwen3 4B — richer paths, pre-fitted J-lens ✓"),
+    ("unsloth/Llama-3.2-1B-Instruct", "Llama 3.2 1B Instruct — chat-tuned paths"),
+    ("Qwen/Qwen2.5-1.5B", "Qwen 2.5 1.5B — a different model family to compare"),
+]
+
+
+def resolve_model_id():
+    """Startup model: env override > the launcher/drawer's saved choice > default."""
+    env = os.environ.get("RESIDUAL_WALKER_MODEL")
+    if env:
+        return env
+    if MODEL_FILE.exists():
+        saved = MODEL_FILE.read_text().strip()
+        if saved:
+            return saved
+    return MODEL_PRESETS[0][0]
+
+
 PORT = int(os.environ.get("RESIDUAL_WALKER_PORT", "8471"))
 JLENS_SPEC = os.environ.get("RESIDUAL_WALKER_JLENS", "auto")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -152,18 +182,19 @@ class ResidualRecorder:
 class Walker:
     """Owns the model and turns prompts into per-token path packets."""
 
-    def __init__(self):
-        print(f"[residual-walker] loading {MODEL_ID} on {DEVICE} ({DTYPE}) ...")
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    def __init__(self, model_id):
+        self.model_id = model_id
+        print(f"[residual-walker] loading {model_id} on {DEVICE} ({DTYPE}) ...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         # eager attention is required for output_attentions: recent transformers
         # under sdpa returns an EMPTY attentions tuple instead of falling back
         self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID, dtype=DTYPE, attn_implementation="eager"
+            model_id, dtype=DTYPE, attn_implementation="eager"
         )
         inner = getattr(self.model, "model", None)
         if inner is None or not hasattr(inner, "layers") or not hasattr(inner, "embed_tokens"):
-            raise SystemExit(
-                f"[residual-walker] {MODEL_ID} is not a supported architecture. "
+            raise RuntimeError(
+                f"{model_id} is not a supported architecture. "
                 "The recorder needs Llama-style modules (model.model.layers[i].self_attn/.mlp) — "
                 "Llama, Qwen2/2.5, and Mistral family models work."
             )
@@ -210,9 +241,9 @@ class Walker:
             if JLENS_SPEC != "auto":
                 path, source = JLENS_SPEC, JLENS_SPEC
             else:
-                fname = JLENS_MODELS.get(MODEL_ID.split("/")[-1].lower())
+                fname = JLENS_MODELS.get(self.model_id.split("/")[-1].lower())
                 if fname is None:
-                    print(f"[residual-walker] no pre-fitted J-lens known for {MODEL_ID} "
+                    print(f"[residual-walker] no pre-fitted J-lens known for {self.model_id} "
                           "(logit lens only; set RESIDUAL_WALKER_JLENS=<lens.pt> to supply one)")
                     return None
                 from huggingface_hub import hf_hub_download
@@ -489,18 +520,19 @@ class Walker:
 
 walker = None
 generation_lock = asyncio.Lock()
+model_loading = {"id": None}   # HF id mid-switch, None when settled
 
 
 @asynccontextmanager
 async def lifespan(app):
     global walker
-    walker = await asyncio.to_thread(Walker)
+    walker = await asyncio.to_thread(Walker, resolve_model_id())
     yield
 
 
 app = FastAPI(lifespan=lifespan)
-STATIC_DIR = Path(__file__).parent / "static"
-EXPORTS_DIR = Path(__file__).parent / "exports"
+STATIC_DIR = APP_DIR / "static"
+EXPORTS_DIR = APP_DIR / "exports"
 EXPORTS_DIR.mkdir(exist_ok=True)
 app.mount("/exports", StaticFiles(directory=EXPORTS_DIR), name="exports")
 
@@ -530,11 +562,112 @@ async def js_module(module: str):
                         headers={"Cache-Control": "no-cache"})
 
 
+MODEL_ID_PATTERN = re.compile(r"[\w.\-]+/[\w.\-]+")
+
+
+def read_custom_models():
+    try:
+        ids = json.loads(CUSTOM_MODELS_FILE.read_text())
+        return [m for m in ids if isinstance(m, str)]
+    except (OSError, ValueError):
+        return []
+
+
+def models_payload():
+    """Everything the model drawer renders: presets, custom adds, and switch state."""
+    preset_ids = {mid for mid, _ in MODEL_PRESETS}
+    models = [{"id": mid, "blurb": blurb, "custom": False} for mid, blurb in MODEL_PRESETS]
+    models += [{"id": mid, "blurb": "", "custom": True}
+               for mid in read_custom_models() if mid not in preset_ids]
+    return {
+        "current": walker.model_id if walker else None,
+        "loading": model_loading["id"],
+        "models": models,
+    }
+
+
+@app.get("/api/models")
+async def list_models():
+    return models_payload()
+
+
+@app.post("/api/models")
+async def add_model(request: Request):
+    """Add a custom HF repo id to the drawer, persisted in .models."""
+    body = await request.json()
+    model_id = str(body.get("id", "")).strip().strip("/")
+    if not MODEL_ID_PATTERN.fullmatch(model_id):
+        return JSONResponse({"error": "expected a HuggingFace id like org/model"},
+                            status_code=400)
+    custom = read_custom_models()
+    if model_id not in custom and model_id not in {mid for mid, _ in MODEL_PRESETS}:
+        CUSTOM_MODELS_FILE.write_text(json.dumps(custom + [model_id], indent=1))
+    return models_payload()
+
+
+@app.delete("/api/models")
+async def remove_model(id: str):
+    """Drop a custom model from the drawer (presets are permanent)."""
+    remaining = [m for m in read_custom_models() if m != id]
+    CUSTOM_MODELS_FILE.write_text(json.dumps(remaining, indent=1))
+    return models_payload()
+
+
+@app.post("/api/model")
+async def switch_model(request: Request):
+    """Swap the loaded model in place.
+
+    The old model is freed BEFORE the new one loads — both may not fit in
+    VRAM together — so a failed load rolls back by reloading the old id.
+    Holding the walk lock serializes switches against generations; the /api
+    endpoints answer 503 while `walker` is down.
+    """
+    global walker
+    body = await request.json()
+    model_id = str(body.get("id", "")).strip()
+    if not MODEL_ID_PATTERN.fullmatch(model_id):
+        return JSONResponse({"error": "expected a HuggingFace id like org/model"},
+                            status_code=400)
+    if generation_lock.locked():
+        return JSONResponse({"error": "busy — a walk or model switch is running"},
+                            status_code=409)
+    async with generation_lock:
+        if walker is not None and model_id == walker.model_id:
+            return await info()
+        old_id = walker.model_id if walker else None
+        model_loading["id"] = model_id
+
+        def load(target):
+            global walker
+            walker = None
+            gc.collect()
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
+            walker = Walker(target)
+
+        try:
+            try:
+                await asyncio.to_thread(load, model_id)
+            except Exception as err:
+                message = f"{type(err).__name__}: {err}"
+                if old_id is not None:
+                    # roll back; if even this fails the server needs a restart,
+                    # and the raised error will say so
+                    await asyncio.to_thread(load, old_id)
+                return JSONResponse({"error": message}, status_code=500)
+            MODEL_FILE.write_text(model_id)
+            return await info()
+        finally:
+            model_loading["id"] = None
+
+
 @app.get("/api/info")
 async def info():
     """Model + lens availability, so the UI can configure itself before a walk."""
+    if walker is None:
+        return JSONResponse({"error": "model loading"}, status_code=503)
     return {
-        "model": MODEL_ID,
+        "model": walker.model_id,
         "device": torch.cuda.get_device_name(0) if DEVICE == "cuda" else "CPU",
         "n_layers": walker.n_layers,
         "hidden": walker.hidden,
@@ -555,6 +688,8 @@ async def qkv(pos: int, layer: int):
     product sees. Valid for every position of the walk because each step
     re-forwards the whole sequence and causal prefixes are identical.
     """
+    if walker is None:
+        return JSONResponse({"error": "model loading"}, status_code=503)
     snap = walker.qkv_snapshot
     if snap is None:
         return JSONResponse({"error": "no walk captured yet"}, status_code=409)
@@ -687,7 +822,8 @@ def build_packet(walker, path_states, pca, scale, temperature, token_index):
 async def walk(ws: WebSocket):
     await ws.accept()
     if generation_lock.locked():
-        await ws.send_json({"type": "error", "message": "A walk is already running."})
+        await ws.send_json({"type": "error",
+                            "message": "busy — a walk or model switch is running"})
         await ws.close()
         return
 
@@ -752,7 +888,7 @@ async def walk(ws: WebSocket):
 
             await ws.send_json({
                 "type": "meta",
-                "model": MODEL_ID,
+                "model": walker.model_id,
                 "device": torch.cuda.get_device_name(0) if DEVICE == "cuda" else "CPU",
                 "n_layers": walker.n_layers,
                 "hidden": walker.hidden,

@@ -11,12 +11,21 @@
 
 <div id="stage">
   <div id="legend">
-    <span class="item"><span class="dot" style="background:var(--embed)"></span>embedding (path start)</span>
-    <span class="item"><span class="dot" style="background:var(--attn)"></span>+ attention step</span>
-    <span class="item"><span class="dot" style="background:var(--mlp)"></span>+ MLP step</span>
-    <span class="item"><span class="dot" style="background:var(--ghost); opacity:.5"></span>earlier tokens (ghosts)</span>
-    <span class="item"><span class="dot" style="background:var(--arc)"></span>k/v stream (attention arcs)</span>
-    <span class="item"><span class="dot" style="background:var(--patch)"></span>💉 patch point (nudge/swap)</span>
+    <span class="item" data-legend="embed" title="click — hide the start orbs and the walking token's trail"><span class="dot" style="background:var(--embed)"></span>embedding (path start)</span>
+    <span class="item" data-legend="attn" title="click — hide the attention orbs"><span class="dot" style="background:var(--attn)"></span>+ attention step</span>
+    <span class="item" data-legend="mlp" title="click — hide the MLP orbs"><span class="dot" style="background:var(--mlp)"></span>+ MLP step</span>
+    <span class="item" data-legend="ghosts" title="click — hide end orbs → hide everything → hide trails → show all"><span class="dot" style="background:var(--ghost); opacity:.5"></span>earlier tokens (ghosts)</span>
+    <span class="item" data-legend="arcs" title="click — toggle the k/v stream arcs"><span class="dot" style="background:var(--arc)"></span>k/v stream (attention arcs)</span>
+    <span class="item" data-legend="patch" title="click — hide patch points"><span class="dot" style="background:var(--patch)"></span>💉 patch point (nudge/swap)</span>
+  </div>
+  <div id="modelConfirm">
+    <div class="card">
+      <div class="msg">Change model to <b id="modelConfirmId"></b> and restart?</div>
+      <div class="row">
+        <button id="modelConfirmYes">Yes, switch</button>
+        <button id="modelConfirmNo">Cancel</button>
+      </div>
+    </div>
   </div>
   <div id="guess"></div>
   <div id="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
@@ -31,7 +40,7 @@
 <aside id="panel">
   <div>
     <h1>Residual Walker</h1>
-    <div id="modelChip">loading model info…</div>
+    <div id="modelChip" title="click to change model">loading model info…</div>
   </div>
 
   <label class="field"><span>Prompt</span>
@@ -156,6 +165,19 @@
       </div>
     </div>
   </div>
+</aside>
+
+<div id="drawerBackdrop"></div>
+<aside id="modelDrawer">
+  <div class="head"><span>Models</span><button id="modelDrawerClose" title="close">✕</button></div>
+  <div id="modelList"></div>
+  <div id="drawerStatus"></div>
+  <div class="addRow">
+    <input id="modelAddInput" type="text" placeholder="add any HF id — org/model" spellcheck="false">
+    <button id="modelAddBtn" title="add to the list">＋</button>
+  </div>
+  <div class="foot">Llama / Qwen2–3 / Mistral-family models work; a new id downloads
+    on its first switch, which can take a while.</div>
 </aside>
 
 <script type="importmap">

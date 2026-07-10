@@ -2,6 +2,7 @@
 .venv/
 .tools/
 .model
+.models
 
 # user output
 exports/

@@ -16,6 +16,7 @@
     --bar: #199e70;
     --patch: #9085e9;
     --arc: #c168e0;
+    --danger: #e5484d;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; }
@@ -39,6 +40,36 @@
   }
   #legend .item { display: flex; align-items: center; gap: 6px; }
   #legend .dot { width: 9px; height: 9px; border-radius: 50%; }
+
+  /* legend entries toggle their scene objects — struck through in red when
+     hidden: ⧸ (partly), ✕ (fully), ⧹ (trails only, ghosts) */
+  #legend .item[data-legend] {
+    pointer-events: auto; cursor: pointer;
+    position: relative; user-select: none;
+  }
+  #legend .item[data-legend]:hover { color: var(--ink); }
+  #legend .item.slash::after, #legend .item.cross::after, #legend .item.backslash::after {
+    content: ""; position: absolute; inset: -2px -4px; pointer-events: none;
+  }
+  #legend .item.slash::after {
+    background: linear-gradient(to top right,
+      transparent calc(50% - 1.6px), var(--danger) calc(50% - 0.8px),
+      var(--danger) calc(50% + 0.8px), transparent calc(50% + 1.6px));
+  }
+  #legend .item.backslash::after {
+    background: linear-gradient(to bottom right,
+      transparent calc(50% - 1.6px), var(--danger) calc(50% - 0.8px),
+      var(--danger) calc(50% + 0.8px), transparent calc(50% + 1.6px));
+  }
+  #legend .item.cross::after {
+    background:
+      linear-gradient(to top right,
+        transparent calc(50% - 1.6px), var(--danger) calc(50% - 0.8px),
+        var(--danger) calc(50% + 0.8px), transparent calc(50% + 1.6px)),
+      linear-gradient(to bottom right,
+        transparent calc(50% - 1.6px), var(--danger) calc(50% - 0.8px),
+        var(--danger) calc(50% + 0.8px), transparent calc(50% + 1.6px));
+  }
 
   #guess {
     position: absolute; pointer-events: none;
@@ -99,7 +130,9 @@
      their overflowing text over their neighbors) */
   #panel > * { flex-shrink: 0; }
   h1 { font-size: 17px; font-weight: 700; }
-  #modelChip { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  #modelChip { font-size: 11px; color: var(--muted); margin-top: 2px; cursor: pointer; }
+  #modelChip:hover { color: var(--danger); }
+  #modelChip.switching { color: var(--danger); cursor: progress; }
 
   label.field { display: block; font-size: 12px; color: var(--ink-2); }
   label.field > span { display: block; margin-bottom: 4px; }
@@ -264,3 +297,79 @@
     white-space: pre-wrap;
   }
   .foot { font-size: 11px; color: var(--muted); line-height: 1.5; }
+
+  /* ---------- model switcher (chip → drawer → confirm) ---------- */
+  /* z-index 30: the confirm card must beat the drawer backdrop (20) and the
+     drawer itself (21), or "Yes, switch" clicks land on the backdrop */
+  #modelConfirm {
+    position: absolute; inset: 0; z-index: 30;
+    display: none; align-items: center; justify-content: center;
+    background: rgba(13, 13, 13, 0.45);
+  }
+  #modelConfirm.open { display: flex; }
+  #modelConfirm .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    max-width: 430px;
+    display: flex; flex-direction: column; gap: 14px;
+    font-size: 14px; line-height: 1.5;
+  }
+  #modelConfirm .row { display: flex; gap: 8px; justify-content: flex-end; }
+  #modelConfirmYes { background: var(--danger); color: #fff; }
+  #modelConfirmYes:hover { filter: brightness(1.12); }
+  #modelConfirmNo { background: transparent; color: var(--ink-2); border-color: var(--border); }
+  #modelConfirmNo:hover { border-color: var(--ink-2); }
+
+  #drawerBackdrop {
+    position: fixed; inset: 0; z-index: 20;
+    background: rgba(0, 0, 0, 0.45);
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.2s;
+  }
+  #drawerBackdrop.open { opacity: 1; pointer-events: auto; }
+  #modelDrawer {
+    position: fixed; top: 0; right: 0; bottom: 0; z-index: 21;
+    width: 344px;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    padding: 16px;
+    display: flex; flex-direction: column; gap: 10px;
+    transform: translateX(102%);
+    transition: transform 0.22s ease;
+  }
+  #modelDrawer.open { transform: translateX(0); }
+  #modelDrawer .head {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 15px; font-weight: 700;
+  }
+  #modelDrawer .head button {
+    background: none; border: none; padding: 2px 6px;
+    color: var(--muted); font-size: 14px;
+  }
+  #modelDrawer .head button:hover { color: var(--ink); }
+  #modelList { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 7px; }
+  .modelEntry {
+    position: relative; text-align: left;
+    background: var(--page);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 11px;
+    display: flex; flex-direction: column; gap: 3px;
+    font-weight: 400;
+  }
+  .modelEntry:hover { border-color: var(--ink-2); }
+  .modelEntry.current { border-color: var(--bar); cursor: default; }
+  .modelEntry .id { font-size: 13px; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+  .modelEntry.current .id::after { content: " · loaded ✓"; color: var(--bar); font-size: 11px; }
+  .modelEntry .blurb { font-size: 11px; color: var(--muted); line-height: 1.45; }
+  .modelEntry .rm { position: absolute; top: 7px; right: 9px; color: var(--muted); font-size: 12px; padding: 2px 4px; }
+  .modelEntry .rm:hover { color: var(--danger); }
+  #drawerStatus { font-size: 11px; color: var(--danger); min-height: 14px; }
+  #modelDrawer .addRow { display: flex; gap: 7px; }
+  #modelDrawer .addRow input { flex: 1; min-width: 0; }
+  #modelDrawer .addRow button {
+    background: transparent; color: var(--ink-2);
+    border-color: var(--border); padding: 8px 13px;
+  }
+  #modelDrawer .addRow button:hover { border-color: var(--ink-2); color: var(--ink); }
