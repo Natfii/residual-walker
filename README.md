@@ -202,6 +202,8 @@ link appears; files land in `exports/`. Requires `ffmpeg` on your PATH.
 
 ## Models
 
+<img width="10%" height="10%" align="right" alt="swap demo" src="https://github.com/user-attachments/assets/8a3e160b-b54d-472b-b305-d97ca4441a4d" />
+
 Any ungated HuggingFace causal LM with Llama-style module structure works —
 Llama, Qwen 2/2.5/3, and Mistral families. The launcher's picker offers a
 few presets; paste any other id at the prompt. Notes:
@@ -215,6 +217,8 @@ few presets; paste any other id at the prompt. Notes:
   (or delete the `.model` file).
 - Bigger models mean more layers per path and slower walks; 1B-class models
   are the sweet spot for watching individual steps.
+
+
 
 ## Configuration
 
