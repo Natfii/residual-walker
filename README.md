@@ -73,6 +73,8 @@ inspector, and arcs always describe the same point.
 
 ## The k/v stream — watching attention read
 
+<img src="docs/qwen.webp" width="720" alt="A transformer token's walk is private except for one channel: at every layer, each token publishes a key and value computed from its current state, and every later token's attention reads that board.">
+
 A transformer token's walk is private except for one channel: at every
 layer, each token publishes a **key** and **value** computed from its
 current state, and every later token's attention reads that board. 
